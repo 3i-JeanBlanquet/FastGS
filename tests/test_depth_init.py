@@ -150,3 +150,46 @@ def test_backproject_translated_camera_offsets_world_points(tmp_path):
     got = set((round(float(p[0]), 6), round(float(p[1]), 6), round(float(p[2]), 6))
               for p in pts)
     assert expected in got
+
+
+def test_backproject_asymmetric_rotation_matches_hand_computed_points(tmp_path):
+    # R = identity is degenerate for this convention: R, R.T, R @ v and v @ R
+    # all coincide, so a transposed/swapped-order/sign-flipped regression in
+    # `C = -cam.R @ cam.T` or `pts_cam @ cam.R.T + C` would pass every other
+    # test in this file unchanged. This test uses a rotation where R, R.T,
+    # and -R are all distinct, so it actually exercises the convention.
+    #
+    # R = Rx(90) @ Rz(90), composing two axis rotations:
+    #   Rz(90) = [[0,-1, 0], [1, 0, 0], [0, 0, 1]]
+    #   Rx(90) = [[1, 0, 0], [0, 0,-1], [0, 1, 0]]
+    #   R = Rx(90) @ Rz(90) = [[0,-1, 0], [0, 0,-1], [1, 0, 0]]
+    R = np.array([
+        [0.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [1.0, 0.0, 0.0],
+    ])
+    T = np.zeros(3)
+    arr = np.full((_H, _W), _DEPTH_MM, dtype=np.uint16)
+    cam = _make_cam(tmp_path, arr, R=R, T=T)
+
+    pts, _ = backproject_points([cam], _SCALE_MM_PER_UNIT, depth_max_m=10.0, stride=4)
+
+    # cam-space samples at stride=4 on the 8x8 grid, (u, v) in {0, 4} x {0, 4}:
+    #   x = (u - 4) * 0.5, y = (v - 4) * 0.5, z = 2.0 (constant depth)
+    # C = -R @ T = 0 here, so world = R @ pts_cam (as a column vector).
+    # Hand-computed via R @ v for each sample:
+    #   (u=0, v=0): cam=(-2,-2, 2) -> R@v = ( 2, -2, -2)
+    #   (u=4, v=0): cam=( 0,-2, 2) -> R@v = ( 2, -2,  0)
+    #   (u=0, v=4): cam=(-2, 0, 2) -> R@v = ( 0, -2, -2)
+    #   (u=4, v=4): cam=( 0, 0, 2) -> R@v = ( 0, -2,  0)
+    expected = np.array([
+        [2.0, -2.0, -2.0],
+        [2.0, -2.0, 0.0],
+        [0.0, -2.0, -2.0],
+        [0.0, -2.0, 0.0],
+    ])
+
+    assert len(pts) == 4
+    pts_sorted = pts[np.lexsort((pts[:, 2], pts[:, 1], pts[:, 0]))]
+    expected_sorted = expected[np.lexsort((expected[:, 2], expected[:, 1], expected[:, 0]))]
+    assert np.allclose(pts_sorted, expected_sorted, atol=1e-4)
