@@ -17,6 +17,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.input_layout import detect_scene_type
 
 class Scene:
 
@@ -40,10 +41,11 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        scene_type = detect_scene_type(args.source_path)
+        if scene_type == "colmap":
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval,
                                                            depth_scale_file=args.depth_scale_file)
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        elif scene_type == "blender":
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
         else:

@@ -15,6 +15,25 @@ def find_model_dir(source_path):
         "No COLMAP model under {}; tried {}".format(source_path, _MODEL_CANDIDATES))
 
 
+def detect_scene_type(source_path):
+    """Return "colmap" if a COLMAP model is discoverable under source_path
+    (sparse/0, sparse, 0, or the bare source root), "blender" if a
+    transforms_train.json file is present instead, or None if neither
+    applies.
+
+    Mirrors Scene.__init__'s dispatch order -- COLMAP takes priority so a
+    directory that happens to contain both is still treated as COLMAP.
+    """
+    try:
+        find_model_dir(source_path)
+        return "colmap"
+    except FileNotFoundError:
+        pass
+    if os.path.exists(os.path.join(source_path, "transforms_train.json")):
+        return "blender"
+    return None
+
+
 def resolve_image_path(source_path, images_arg, colmap_name):
     """Resolve a COLMAP image name to a path on disk.
 

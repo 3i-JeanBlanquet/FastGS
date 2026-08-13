@@ -1,6 +1,6 @@
 import os
 import pytest
-from utils.input_layout import find_model_dir, resolve_image_path, resolve_depth_path
+from utils.input_layout import find_model_dir, resolve_image_path, resolve_depth_path, detect_scene_type
 
 PREFIX = "/Users/3i-a1-2025-003/Documents/repositories/rnd.toolkit/pipeline"
 SCENE_MESH = os.path.join(PREFIX, "rnd.project.mesh/test/input3")
@@ -153,3 +153,63 @@ def test_resolve_depth_path_returns_none_when_absent(tmp_path):
     p = tmp_path / "x.jpg"
     p.write_bytes(b"")
     assert resolve_depth_path(str(p)) is None
+
+
+# detect_scene_type: the Scene.__init__ dispatch decision, factored out so it
+# is testable without importing `scene` (which chains to the CUDA-only
+# simple_knn._C extension via scene/gaussian_model.py).
+
+def test_detect_scene_type_sparse_zero(tmp_path):
+    """sparse/0 layout -> colmap."""
+    sparse_dir = tmp_path / "sparse" / "0"
+    sparse_dir.mkdir(parents=True)
+    (sparse_dir / "cameras.bin").write_bytes(b"")
+    assert detect_scene_type(str(tmp_path)) == "colmap"
+
+
+def test_detect_scene_type_sparse_only(tmp_path):
+    """sparse/ (no /0) layout -> colmap."""
+    sparse_dir = tmp_path / "sparse"
+    sparse_dir.mkdir()
+    (sparse_dir / "cameras.bin").write_bytes(b"")
+    assert detect_scene_type(str(tmp_path)) == "colmap"
+
+
+def test_detect_scene_type_bare_zero(tmp_path):
+    """0/ at the source root, no sparse/ wrapper -> colmap.
+
+    This is the layout of the primary target dataset (input3/0/ holding the
+    COLMAP model alongside sibling rig-*/ image+depth directories) and is
+    exactly the case the old `os.path.exists(.../"sparse")` check missed.
+    """
+    zero_dir = tmp_path / "0"
+    zero_dir.mkdir()
+    (zero_dir / "cameras.bin").write_bytes(b"")
+    assert detect_scene_type(str(tmp_path)) == "colmap"
+
+
+def test_detect_scene_type_bare_root(tmp_path):
+    """COLMAP model files directly at the source root -> colmap."""
+    (tmp_path / "cameras.bin").write_bytes(b"")
+    assert detect_scene_type(str(tmp_path)) == "colmap"
+
+
+def test_detect_scene_type_blender(tmp_path):
+    """No COLMAP model anywhere, but transforms_train.json present -> blender."""
+    (tmp_path / "transforms_train.json").write_text("{}")
+    assert detect_scene_type(str(tmp_path)) == "blender"
+
+
+def test_detect_scene_type_neither(tmp_path):
+    """Neither a COLMAP model nor transforms_train.json -> None."""
+    assert detect_scene_type(str(tmp_path)) is None
+
+
+def test_detect_scene_type_prefers_colmap_when_both_present(tmp_path):
+    """A directory with both a COLMAP model and transforms_train.json is
+    still colmap -- matches Scene.__init__'s original if/elif priority."""
+    sparse_dir = tmp_path / "sparse" / "0"
+    sparse_dir.mkdir(parents=True)
+    (sparse_dir / "cameras.bin").write_bytes(b"")
+    (tmp_path / "transforms_train.json").write_text("{}")
+    assert detect_scene_type(str(tmp_path)) == "colmap"
