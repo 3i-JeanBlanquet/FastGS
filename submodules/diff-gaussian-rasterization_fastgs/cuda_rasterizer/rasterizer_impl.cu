@@ -248,7 +248,7 @@ CudaRasterizer::SampleState CudaRasterizer::SampleState::fromChunk(char *& chunk
 	SampleState sample;
 	obtain(chunk, sample.bucket_to_tile, C * BLOCK_SIZE, 128);
 	obtain(chunk, sample.T, C * BLOCK_SIZE, 128);
-	obtain(chunk, sample.ar, NUM_CHAFFELS * C * BLOCK_SIZE, 128);
+	obtain(chunk, sample.ar, (NUM_CHAFFELS + 1) * C * BLOCK_SIZE, 128);
 	return sample;
 }
 
@@ -314,6 +314,8 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	const float tan_fovx, float tan_fovy,
 	const bool prefiltered,
 	float* out_color,
+	float* out_depth,
+	float* out_alpha,
 	int* radii,
 	bool debug,
 	bool get_flag,
@@ -443,6 +445,7 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		width, height,
 		geomState.means2D,
 		feature_ptr,
+		geomState.depths,
 		geomState.conic_opacity,
 		imgState.accum_alpha,
 		imgState.n_contrib,
@@ -450,6 +453,8 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		imgState.pixel_colors,
 		background,
 		out_color,
+		out_depth,
+		out_alpha,
 		imgState.contrib_scan,
 		imgState.scan_size,
 		radii,

@@ -491,7 +491,10 @@ PerGaussianRenderCUDA(
 
   // shared memory
   __shared__ float Shared_sampled_ar[32 * C + 1];
-  sampled_ar += global_bucket_idx * BLOCK_SIZE * C;
+  // The forward pass checkpoints C colour channels plus one depth channel per
+  // bucket-thread, so the per-bucket stride is (C + 1), not C. The depth slot
+  // itself is not read here -- the backward depth gradient is not implemented.
+  sampled_ar += global_bucket_idx * BLOCK_SIZE * (C + 1);
   __shared__ float Shared_pixels[32 * C];
 
 	// iterate over all pixels in the tile
