@@ -54,6 +54,10 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.depths = ""            # empty string disables depth supervision
+        self.depth_scale_file = ""  # defaults to <model_dir>/depth_scale.json when empty
+        self.depth_max = 30.0       # metres
+        self.depth_on_cpu = False
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

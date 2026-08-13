@@ -17,7 +17,8 @@ from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
-                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
+                 sensor_depth=None, depth_mask=None, depth_on_cpu=False
                  ):
         super(Camera, self).__init__()
 
@@ -50,6 +51,16 @@ class Camera(nn.Module):
 
         self.trans = trans
         self.scale = scale
+
+        self.sensor_depth = None
+        self.depth_mask = None
+        if sensor_depth is not None:
+            # fp16 depth + bool mask is ~550 MB across 176 cameras at 1024^2, on top of
+            # the ~2.2 GB the RGB images already hold. --depth_on_cpu trades latency for
+            # VRAM on smaller cards.
+            dev = torch.device("cpu") if depth_on_cpu else self.data_device
+            self.sensor_depth = sensor_depth.to(dev).half()
+            self.depth_mask = depth_mask.to(dev)
 
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
