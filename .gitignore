@@ -1,0 +1,16 @@
+# Controller/agent scratch for the depth-supervision work
+.superpowers/
+
+# Python bytecode. Upstream committed some .pyc files; those stay tracked, but
+# locally-generated ones must never be staged -- they land in diffs as binary
+# blobs and break patch-based syncing to the GPU container.
+__pycache__/
+*.py[cod]
+
+# Build artefacts from `setup.py build_ext --inplace`
+*.so
+build/
+*.egg-info/
+
+# Training output
+output/
