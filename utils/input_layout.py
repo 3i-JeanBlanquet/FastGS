@@ -26,7 +26,6 @@ def resolve_image_path(source_path, images_arg, colmap_name):
     candidates = [
         os.path.join(source_path, colmap_name),                  # rig dirs at root
         os.path.join(source_path, reading_dir, colmap_name),     # rig dirs under images/
-        os.path.join(source_path, reading_dir, os.path.basename(colmap_name)),  # flat
     ]
     for c in candidates:
         if os.path.exists(c):
@@ -40,11 +39,38 @@ def resolve_depth_path(image_path):
     stem, _ = os.path.splitext(image_path)
     d = os.path.dirname(image_path)
     base = os.path.basename(stem)
+
     candidates = [
-        stem + "_depth.png",                                   # sibling suffix form
-        os.path.join(os.path.dirname(d), "depths", base + ".png"),  # images/ + depths/
-        os.path.join(d, "..", "depths", base + ".png"),
+        stem + "_depth.png",  # sibling suffix form
     ]
+
+    # Walk up to 2 levels looking for depths/ sibling.
+    # Preserve rig subdirectory when present.
+    current_dir = d
+    rig_subdir = None  # Remember rig directory if we encounter one
+    for _ in range(2):
+        parent_dir = os.path.dirname(current_dir)
+        if parent_dir == current_dir:
+            break  # reached root
+
+        dir_name = os.path.basename(current_dir)
+
+        # Track rig directory on first iteration
+        if rig_subdir is None and dir_name.startswith("rig-"):
+            rig_subdir = dir_name
+
+        # depths is a sibling of parent_dir
+        depths_dir = os.path.join(parent_dir, "depths")
+
+        # Try with rig subdirectory preserved
+        if rig_subdir is not None:
+            candidates.append(os.path.join(depths_dir, rig_subdir, base + ".png"))
+
+        # Try without rig subdirectory
+        candidates.append(os.path.join(depths_dir, base + ".png"))
+
+        current_dir = parent_dir
+
     for c in candidates:
         if os.path.exists(c):
             return os.path.normpath(c)
