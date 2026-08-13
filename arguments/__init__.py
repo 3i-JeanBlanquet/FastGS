@@ -58,6 +58,8 @@ class ModelParams(ParamGroup):
         self.depth_scale_file = ""  # defaults to <model_dir>/depth_scale.json when empty
         self.depth_max = 30.0       # metres
         self.depth_on_cpu = False
+        self.init_from_depth = False   # replace COLMAP sparse points with dense backprojection
+        self.depth_init_voxel = 0.02   # voxel size (COLMAP units) for downsampling the backprojection
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

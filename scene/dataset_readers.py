@@ -23,6 +23,7 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils.input_layout import find_model_dir, resolve_image_path, resolve_depth_path
+from utils.depth_init import backproject_cameras
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -135,7 +136,8 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, eval, llffhold=8, depth_scale_file=""):
+def readColmapSceneInfo(path, images, eval, llffhold=8, depth_scale_file="",
+                        init_from_depth=False, depth_init_voxel=0.02, depth_max=30.0):
     model_dir = find_model_dir(path)
     try:
         cameras_extrinsic_file = os.path.join(model_dir, "images.bin")
@@ -180,10 +182,31 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, depth_scale_file=""):
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+
+    pcd = None
+    if init_from_depth:
+        if depth_scale is None:
+            print("init_from_depth requested but no depth_scale.json was found; "
+                  "falling back to COLMAP sparse points.")
+        else:
+            print("Initialising from dense backprojected depth (init_from_depth=True)...")
+            try:
+                pcd = backproject_cameras(cam_infos, depth_scale, depth_init_voxel,
+                                          depth_max_m=depth_max)
+                if pcd is None or len(pcd.points) == 0:
+                    print("Dense depth backprojection produced no points; "
+                          "falling back to COLMAP sparse points.")
+                    pcd = None
+            except Exception as e:
+                print("Dense depth initialisation failed ({}); "
+                      "falling back to COLMAP sparse points.".format(e))
+                pcd = None
+
+    if pcd is None:
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

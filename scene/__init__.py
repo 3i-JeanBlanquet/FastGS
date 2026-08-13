@@ -44,7 +44,10 @@ class Scene:
         scene_type = detect_scene_type(args.source_path)
         if scene_type == "colmap":
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval,
-                                                           depth_scale_file=args.depth_scale_file)
+                                                           depth_scale_file=args.depth_scale_file,
+                                                           init_from_depth=args.init_from_depth,
+                                                           depth_init_voxel=args.depth_init_voxel,
+                                                           depth_max=args.depth_max)
         elif scene_type == "blender":
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
