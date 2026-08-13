@@ -55,19 +55,27 @@ from a completely different direction:
 | `depth_unit_scale_factor = 0.001` | depth PNGs are millimetres |
 | `is_euclidean_depth = False` | depth is **z-distance, not Euclidean** — matches the 2.80 % vs 10.07 % measurement |
 
-### Open question: which poses reach FastGS
+### Resolved: FastGS receives non-metric COLMAP poses, at a per-scene scale
 
-`auto_scale_poses = False`, commented *"False keeps metric scale"*, implies the
-dn-splatter path receives metric poses — plausible since LIVO (LiDAR-inertial-
-visual odometry) is metric by construction. But the COLMAP model measured below
-is **not** metric (3.94 m/unit), because a free SfM reconstruction is only
-determined up to scale.
+`auto_scale_poses = False` describes the dn-splatter/LIVO path, not the FastGS
+one. Measured on the canonical FastGS input (`rnd.project.mesh/test/input3`,
+28 stations × 4 faces) and cross-checked against a second capture:
 
-If FastGS is fed LIVO poses, Stage 1 calibration degenerates to a no-op check.
-If it is fed COLMAP poses, Stage 1 is mandatory. The calibration script handles
-both — it measures the scale and reports it, rather than assuming either — so
-this question does not block implementation. It does determine whether the
-scale it prints should be ≈1.0 or ≈3939.
+| scene | scale (mm/unit) | planar MAD | radial corr | camera bbox (m) |
+|---|---|---|---|---|
+| `rnd.project.reconstruction/test` | 3939.7 | 2.80 % | −0.247 | 37.1 × 0.42 × 24.3 |
+| `rnd.project.mesh/test/input3` | **4135.3** | 8.28 % | −0.464 | 25.6 × 1.11 × 11.1 |
+
+Both cluster near 4 m/unit, which suggests a systematic normalisation rather
+than a freely-drifting SfM scale. But they differ by **5.0 %**, and scene 2's
+per-image spread is ±13.3 %. **The scale must therefore be measured per scene.**
+It cannot be hardcoded, and it cannot be approximated at 4.0.
+
+This makes Stage 1 mandatory rather than conditional.
+
+Planar Z is confirmed a second time and more strongly: scene 2's residual
+correlation with the radial factor is **+0.025** — essentially zero, the exact
+signature expected when the convention is right — against radial's −0.464.
 
 ## Target data
 
@@ -76,8 +84,9 @@ Measured from the reference capture at
 
 | property | value |
 |---|---|
+| Layout | rig folders at the input root, COLMAP model in `0/` |
 | Rig | 4 pinhole cube faces per station, yaw 0°/90°/180°/270° |
-| Stations | 44 (176 images) |
+| Stations | 44 (176 images); canonical `input3` sample is 28 (112 images) |
 | Intrinsics | `fx = fy = 506.91`, `cx = cy = 512`, 1024×1024 → 90.6° FOV |
 | RGB | `<uuid>.jpg`, 1024×1024 |
 | Depth | `<uuid>_depth.png`, 1024×1024, uint16, **0 = invalid** |
