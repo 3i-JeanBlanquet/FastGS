@@ -21,6 +21,54 @@ rasterizer emits colour and radii and nothing else — no depth, no alpha
 This design adds metric depth supervision so the geometry is constrained
 directly.
 
+## Pipeline context
+
+FastGS is already deployed inside `rnd.gaussian_splatting` as the fast half of a
+hybrid engine (`run.py:325 run_fastgs`), alongside **dn-splatter**, which is
+itself a depth- and normal-supervised splatting method. The deployed FastGS copy
+(commit `fe3a518`) is unmodified vanilla — `train.py` contains no depth
+references.
+
+So the goal is not to invent depth supervision for this stack. It is to give the
+*fast* engine the capability the *slow* engine already has, so choosing FastGS
+stops meaning giving up geometry.
+
+That has a direct consequence for this design: **match dn-splatter's depth loss
+rather than inventing one.** Its settings are already tuned on this exact
+capture (`run.py:37 DEPTH_PRESET`):
+
+```python
+use_depth_loss=True, depth_loss_type="EdgeAwareLogL1",
+depth_lambda=0.2, normal_supervision="depth"
+```
+
+Matching means the two engines are comparable, and the tuning knowledge
+transfers instead of being rediscovered.
+
+### What the existing stack independently confirms
+
+`dn_splatter/data/livo_dataparser.py` corroborates both measured facts below,
+from a completely different direction:
+
+| dataparser setting | confirms |
+|---|---|
+| `depth_unit_scale_factor = 0.001` | depth PNGs are millimetres |
+| `is_euclidean_depth = False` | depth is **z-distance, not Euclidean** — matches the 2.80 % vs 10.07 % measurement |
+
+### Open question: which poses reach FastGS
+
+`auto_scale_poses = False`, commented *"False keeps metric scale"*, implies the
+dn-splatter path receives metric poses — plausible since LIVO (LiDAR-inertial-
+visual odometry) is metric by construction. But the COLMAP model measured below
+is **not** metric (3.94 m/unit), because a free SfM reconstruction is only
+determined up to scale.
+
+If FastGS is fed LIVO poses, Stage 1 calibration degenerates to a no-op check.
+If it is fed COLMAP poses, Stage 1 is mandatory. The calibration script handles
+both — it measures the scale and reports it, rather than assuming either — so
+this question does not block implementation. It does determine whether the
+scale it prints should be ≈1.0 or ≈3939.
+
 ## Target data
 
 Measured from the reference capture at
@@ -189,37 +237,41 @@ independently of whatever scale a given COLMAP run happens to produce:
 1. `d > 0` (sensor invalid marker)
 2. `d < --depth_max` (default 30 m; observed maxima reach 41 m through windows,
    where the depth is unreliable)
-3. **Erosion at depth discontinuities.** The supplied depth is completed/learned,
-   not raw sensor: object silhouettes bleed several pixels, visibly haloing the
-   chairs. Supervising those pixels drags geometry into empty space around every
-   object edge — a failure that would present as exactly the floaters this work
-   is meant to remove. A gradient-magnitude threshold plus a small dilation of
-   the rejected set removes them cheaply.
+Silhouette bleed is handled by the loss rather than the mask — see below.
 
 Storage: depth as fp16 plus a uint8 mask is ~553 MB across 176 cameras at 1024²,
 on top of the ~2.2 GB the RGB images already occupy. Acceptable on 24 GB; a
 `--depth_on_cpu` fallback is provided for smaller cards.
 
-**`utils/loss_utils.py`** — masked depth loss:
+**`utils/loss_utils.py`** — port dn-splatter's `EdgeAwareLogL1` as the default:
 
 ```
-L_depth = mean(|D_render - D_gt|[mask])
+L_depth = mean( log(1 + |D_render - D_gt|) * exp(-|grad(RGB)|) )[mask]
 loss = (1 - lambda_dssim) * L1 + lambda_dssim * (1 - SSIM) + lambda_depth * L_depth
 ```
 
-L1 by default, Huber available. **Not inverse depth**, deliberately: INRIA
-renders inverse depth because monocular predictors output it, but on bounded
-metric depth an inverse-depth L1 weights a chair at 1 m roughly 64× more than a
-wall at 8 m. Walls and floors are where the floaters are, so that weighting is
-backwards for this goal. Rendering true depth also keeps the parameterisation
-choice in Python, where it is cheap to change.
+Two properties matter here, and both are reasons to copy rather than invent.
 
-`lambda_depth` defaults to 0.05 as a starting point, not a derived value. Scene
-depths are around 1.7 COLMAP units (≈6.7 m at the measured scale), so a
-few-percent depth error produces a residual of the same rough order as the RGB
-L1 term rather than one that dwarfs it. That makes the correct weight a matter
-of measurement, not arithmetic: sweep it on one scene before adopting a default,
-and treat any value that visibly degrades PSNR as too high.
+The **edge-aware weight** `exp(-|grad(RGB)|)` down-weights the depth loss wherever
+the RGB image has strong gradients — which is precisely where object silhouettes
+are, and precisely where this completed/learned depth bleeds several pixels.
+That is a more principled fix than the mask erosion originally proposed here: it
+degrades smoothly with edge strength instead of making a hard include/exclude
+decision, and it is already validated on this capture.
+
+The **log** compresses large residuals, so the handful of grossly wrong pixels
+(windows, reflective surfaces) cannot dominate the gradient.
+
+`lambda_depth` defaults to **0.2**, matching `DEPTH_PRESET`, rather than a value
+derived from first principles — it is a measured setting from the same data.
+`--depth_loss {edgeaware_logl1, logl1, l1, huber}` allows falling back.
+
+**Not inverse depth**, deliberately: INRIA renders inverse depth because
+monocular predictors output it, but on bounded metric depth an inverse-depth L1
+weights a chair at 1 m roughly 64× more than a wall at 8 m. Walls and floors are
+where the floaters are, so that weighting is backwards for this goal. Rendering
+true depth also keeps the parameterisation choice in Python, where it is cheap
+to change.
 
 **Initialisation** — `--init_from_depth` backprojects the depth maps into a
 dense point cloud (voxel-downsampled) in place of COLMAP's 13,258 sparse points.
@@ -232,18 +284,39 @@ kernel work slips.
 |---|---|---|
 | `--depths` | `""` | enable depth supervision |
 | `--depth_scale_file` | `<colmap>/depth_scale.json` | calibration from Stage 1 |
-| `--lambda_depth` | `0.05` | depth loss weight |
-| `--depth_loss` | `l1` | `l1` \| `huber` |
+| `--lambda_depth` | `0.2` | depth loss weight (matches dn-splatter) |
+| `--depth_loss` | `edgeaware_logl1` | `edgeaware_logl1` \| `logl1` \| `l1` \| `huber` |
 | `--depth_max` | `30.0` | metres; reject beyond |
 | `--depth_from_iter` | `0` | delay depth supervision |
 | `--init_from_depth` | `False` | dense backprojected init |
 | `--depth_on_cpu` | `False` | keep depth off-GPU |
 | `--rescale_to_metric` | `False` | emit a metrically-scaled PLY |
 
+## Build environment
+
+Verified on `3i-instance-high` (RTX 6000 Ada, 48 GB, 32 cores), inside the
+`rnd-3dgs` container's `fastgs` conda env:
+
+| | |
+|---|---|
+| Python / torch | 3.7.13 / 1.12.1 + cu116 |
+| nvcc | 11.6.55 — **present, so the rasterizer can be built here** |
+| arch list | up to `sm_86`; the Ada card (`sm_89`) runs via PTX JIT |
+
+CUDA 11.6 cannot target `sm_89` directly, so the extension builds `sm_86 + PTX`
+as the existing Dockerfile already does. All CUDA work must compile under
+**torch 1.12 / C++14 era APIs**, not the torch 2.x conventions used by current
+upstream rasterizers — a constraint worth stating explicitly, since the INRIA
+reference being ported from targets a newer toolchain.
+
+Host disk is at 92 % (36 GB free of 457 GB). Build artifacts and a second set of
+training outputs should be sized against that before long runs.
+
 ## Testing
 
-The CUDA cannot be compiled on the development machine (macOS, no NVIDIA), so
-verification is staged by what can be checked where.
+The CUDA cannot be compiled on the development machine (macOS, no NVIDIA), but
+it can be built and tested on the GPU node above, so verification is staged by
+what can be checked where.
 
 **Locally, today:**
 - Calibration script against the reference capture; the planar/radial margin and
@@ -294,7 +367,9 @@ fix them.
 
 | risk | mitigation |
 |---|---|
-| Silhouette bleed in completed depth drags geometry into free space | discontinuity-aware mask erosion (Stage 3) |
+| Silhouette bleed in completed depth drags geometry into free space | `EdgeAwareLogL1`, already validated on this capture (Stage 3) |
+| CUDA reference targets torch 2.x; build env is torch 1.12 / cu11.6 | port against 1.12-era APIs; build early to surface incompatibilities before the logic is finished |
+| GPU host at 92 % disk | size artifacts before long runs |
 | Unreliable depth through windows (up to 41 m observed) | `--depth_max` clamp; low-alpha masking |
 | CUDA written without local compilation | port from a proven reference; finite-difference gradient check before any training run |
 | `lambda_depth` mis-tuned, geometry fights photometry | `--depth_from_iter`; sweep on one scene before adopting |
