@@ -14,7 +14,7 @@ import numpy as np
 import os, random, time
 from random import randint
 from lpipsPyTorch import lpips
-from utils.loss_utils import l1_loss
+from utils.loss_utils import l1_loss, depth_loss_fn, depth_supervision_mask
 from fused_ssim import fused_ssim as fast_ssim
 from gaussian_renderer import render_fastgs, network_gui_ws
 import sys
@@ -34,7 +34,11 @@ except ImportError:
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 
 
+_depth_mask_logged = False
+
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
+    global _depth_mask_logged
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -101,6 +105,30 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         ssim_value = fast_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+
+        if opt.lambda_depth > 0 and viewpoint_cam.sensor_depth is not None \
+                and iteration >= opt.depth_from_iter:
+            # render_pkg["depth"] is un-normalised expected depth D = sum(d*alpha*T);
+            # partial coverage under-reports distance, so we only ever supervise
+            # pixels the sensor trusts AND the renderer is confident about
+            # (alpha > 0.95). We never divide by alpha to "correct" D -- that is
+            # unstable near alpha = 0 -- and we build new tensors here rather
+            # than touching render_pkg["depth"] in place, since it is still
+            # needed by the backward pass.
+            pred_depth = render_pkg["depth"].unsqueeze(0)
+            alpha = render_pkg["alpha"]
+            gt_depth = viewpoint_cam.sensor_depth.to(pred_depth.device).float()
+            sensor_mask = viewpoint_cam.depth_mask.to(alpha.device)
+            depth_mask = depth_supervision_mask(sensor_mask, alpha)
+            if not _depth_mask_logged:
+                frac = depth_mask.float().mean().item()
+                print("[depth] surviving supervision mask fraction (sensor & alpha>0.95): "
+                      "{:.4f}".format(frac))
+                _depth_mask_logged = True
+            Ldepth = depth_loss_fn(opt.depth_loss)(
+                pred_depth, gt_depth, gt_image, depth_mask)
+            loss = loss + opt.lambda_depth * Ldepth
+
         loss.backward()
 
         iter_end.record()

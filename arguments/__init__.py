@@ -107,6 +107,11 @@ class OptimizationParams(ParamGroup):
 
         self.random_background = False
         self.optimizer_type = "default"
+
+        # depth supervision
+        self.lambda_depth = 0.2
+        self.depth_from_iter = 0
+        self.depth_loss = "edgeaware_logl1"
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

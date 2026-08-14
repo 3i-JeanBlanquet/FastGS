@@ -65,3 +65,89 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else:
         return ssim_map.mean(1).mean(1).mean(1)
 
+
+# --- Metric depth supervision -------------------------------------------------
+#
+# The rasterizer renders UNNORMALISED expected depth D = sum_i(d_i * alpha_i * T_i).
+# Wherever coverage is partial, D under-reports distance (a pixel at true depth
+# 3.0 with alpha 0.6 renders as 1.8), so supervising those pixels systematically
+# drags geometry toward the camera -- worst at depth discontinuities, and
+# silently. ALPHA_THRESHOLD gates which pixels are trustworthy enough to
+# supervise; dividing by alpha to "correct" D was considered and rejected as
+# numerically unstable near alpha = 0.
+
+ALPHA_THRESHOLD = 0.95
+
+
+def depth_supervision_mask(sensor_mask, alpha, threshold=ALPHA_THRESHOLD):
+    """AND the sensor's valid-depth mask with high-alpha rendered coverage.
+
+    `alpha` is the rasterizer's rendered alpha (render_pkg["alpha"]) and is
+    treated as non-differentiable here -- it is only used to build a boolean
+    mask, never to rescale a gradient-carrying tensor.
+
+    sensor_mask: bool tensor, shaped [1, H, W] (or [H, W]).
+    alpha:       float tensor, shaped [H, W] (or matching sensor_mask).
+    Returns a bool tensor broadcastable against sensor_mask's shape.
+    """
+    alpha_ok = alpha.detach() > threshold
+    if alpha_ok.dim() == sensor_mask.dim() - 1:
+        alpha_ok = alpha_ok.unsqueeze(0)
+    return sensor_mask & alpha_ok
+
+
+def edge_aware_logl1_loss(pred, gt, rgb, mask):
+    """dn-splatter's EdgeAwareLogL1.
+
+    log() keeps a handful of grossly-wrong pixels (windows, reflections) from
+    dominating. The exp(-|grad rgb|) weight down-weights the loss at image
+    edges, which is where this completed depth bleeds across silhouettes.
+
+    `mask` should already fold in any depth-quality gating (e.g.
+    depth_supervision_mask) on top of plain sensor validity -- this function
+    only ever reads from `pred`/`gt`, so it never mutates the tensors it is
+    given (safe to call directly on render_pkg["depth"]).
+    """
+    logl1 = torch.log(1.0 + torch.abs(pred - gt))
+
+    grad_x = torch.abs(rgb[:, :, :-1] - rgb[:, :, 1:]).mean(0, keepdim=True)
+    grad_y = torch.abs(rgb[:, :-1, :] - rgb[:, 1:, :]).mean(0, keepdim=True)
+    wx = torch.exp(-grad_x)
+    wy = torch.exp(-grad_y)
+
+    mx, my = mask[:, :, :-1], mask[:, :-1, :]
+    lx = (logl1[:, :, :-1] * wx)[mx]
+    ly = (logl1[:, :-1, :] * wy)[my]
+
+    n = lx.numel() + ly.numel()
+    if n == 0:
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+    return (lx.sum() + ly.sum()) / n
+
+
+def depth_loss_fn(name):
+    """Resolve --depth_loss to a callable with signature (pred, gt, rgb, mask).
+
+    Every variant is masked -- callers are expected to pass a `mask` that
+    already combines sensor validity with the alpha gate from
+    depth_supervision_mask, so none of these need to know about alpha
+    directly. A fully-false mask returns a finite zero rather than NaN.
+    """
+    def _masked(f):
+        def g(pred, gt, rgb, mask):
+            if mask.sum() == 0:
+                return torch.zeros((), device=pred.device, dtype=pred.dtype)
+            return f(pred[mask], gt[mask])
+        return g
+
+    table = {
+        "edgeaware_logl1": edge_aware_logl1_loss,
+        "logl1": _masked(lambda p, g: torch.log(1.0 + torch.abs(p - g)).mean()),
+        "l1": _masked(lambda p, g: torch.abs(p - g).mean()),
+        "huber": _masked(lambda p, g: F.smooth_l1_loss(p, g)),
+    }
+    if name not in table:
+        raise ValueError("unknown --depth_loss {!r}; choose from {}".format(
+            name, sorted(table)))
+    return table[name]
+
