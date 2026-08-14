@@ -62,10 +62,30 @@ class Camera(nn.Module):
             self.sensor_depth = sensor_depth.to(dev).half()
             self.depth_mask = depth_mask.to(dev)
 
+        # Cache for the EdgeAwareLogL1 RGB edge weights (see
+        # get_depth_edge_weights): original_image is fixed for the life of
+        # this Camera, so these are identical on every training iteration.
+        self._depth_edge_wx = None
+        self._depth_edge_wy = None
+
         self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+    def get_depth_edge_weights(self):
+        """Lazily compute and cache the EdgeAwareLogL1 RGB edge weights.
+
+        `original_image` is static for the life of this Camera, so the
+        exp(-|grad rgb|) weights consumed by edge_aware_logl1_loss are
+        identical on every training iteration -- computed once here on first
+        use (matching training.py's existing `.cuda()` call on
+        original_image) rather than recomputed from scratch every iteration.
+        """
+        if self._depth_edge_wx is None:
+            from utils.loss_utils import compute_edge_weights
+            self._depth_edge_wx, self._depth_edge_wy = compute_edge_weights(self.original_image.cuda())
+        return self._depth_edge_wx, self._depth_edge_wy
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):

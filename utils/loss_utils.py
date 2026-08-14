@@ -96,7 +96,21 @@ def depth_supervision_mask(sensor_mask, alpha, threshold=ALPHA_THRESHOLD):
     return sensor_mask & alpha_ok
 
 
-def edge_aware_logl1_loss(pred, gt, rgb, mask):
+def compute_edge_weights(rgb):
+    """exp(-|grad rgb|) edge weights consumed by edge_aware_logl1_loss.
+
+    `rgb` is a camera's ground-truth image, which is STATIC for the entire
+    training run -- these weights are therefore identical on every iteration
+    for a given camera. Callers that iterate (e.g. the training loop) should
+    compute this once per camera and reuse the result (see
+    Camera.get_depth_edge_weights) rather than paying for it every call.
+    """
+    grad_x = torch.abs(rgb[:, :, :-1] - rgb[:, :, 1:]).mean(0, keepdim=True)
+    grad_y = torch.abs(rgb[:, :-1, :] - rgb[:, 1:, :]).mean(0, keepdim=True)
+    return torch.exp(-grad_x), torch.exp(-grad_y)
+
+
+def edge_aware_logl1_loss(pred, gt, rgb, mask, weights=None):
     """dn-splatter's EdgeAwareLogL1.
 
     log() keeps a handful of grossly-wrong pixels (windows, reflections) from
@@ -107,13 +121,16 @@ def edge_aware_logl1_loss(pred, gt, rgb, mask):
     depth_supervision_mask) on top of plain sensor validity -- this function
     only ever reads from `pred`/`gt`, so it never mutates the tensors it is
     given (safe to call directly on render_pkg["depth"]).
+
+    `weights`, if given, is a precomputed `(wx, wy)` pair from
+    compute_edge_weights(rgb) -- since rgb is static per camera, callers may
+    cache and pass these in instead of recomputing them from `rgb` on every
+    call. Defaults to None, which recomputes them from `rgb` exactly as
+    before, so existing callers are unaffected.
     """
     logl1 = torch.log(1.0 + torch.abs(pred - gt))
 
-    grad_x = torch.abs(rgb[:, :, :-1] - rgb[:, :, 1:]).mean(0, keepdim=True)
-    grad_y = torch.abs(rgb[:, :-1, :] - rgb[:, 1:, :]).mean(0, keepdim=True)
-    wx = torch.exp(-grad_x)
-    wy = torch.exp(-grad_y)
+    wx, wy = weights if weights is not None else compute_edge_weights(rgb)
 
     mx, my = mask[:, :, :-1], mask[:, :-1, :]
     lx = (logl1[:, :, :-1] * wx)[mx]
@@ -134,7 +151,7 @@ def depth_loss_fn(name):
     directly. A fully-false mask returns a finite zero rather than NaN.
     """
     def _masked(f):
-        def g(pred, gt, rgb, mask):
+        def g(pred, gt, rgb, mask, weights=None):
             if mask.sum() == 0:
                 return torch.zeros((), device=pred.device, dtype=pred.dtype)
             return f(pred[mask], gt[mask])

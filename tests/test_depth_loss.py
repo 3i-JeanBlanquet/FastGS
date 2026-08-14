@@ -10,10 +10,13 @@
 # Pure torch, no CUDA needed: everything here operates on hand-built tensors.
 #
 
+import numpy as np
+import pytest
 import torch
 
 from utils.loss_utils import (
     ALPHA_THRESHOLD,
+    compute_edge_weights,
     depth_loss_fn,
     depth_supervision_mask,
     edge_aware_logl1_loss,
@@ -143,3 +146,66 @@ def test_depth_loss_fn_rejects_unknown_name():
         pass
     else:
         assert False, "expected ValueError for an unknown --depth_loss name"
+
+
+# --- Cached edge weights: the optimisation must not change the result -----------
+#
+# edge_aware_logl1_loss recomputed exp(-|grad rgb|) from `rgb` on every call, even
+# though `rgb` (a camera's ground-truth image) is static for the whole training
+# run. compute_edge_weights() lets a caller (Camera.get_depth_edge_weights) do
+# that work once per camera instead of once per iteration. These tests prove the
+# cached path is bit-for-bit equivalent to the original always-recompute path --
+# an optimisation that changes the loss value is a bug, not a speed-up.
+
+def test_compute_edge_weights_matches_inline_formula():
+    rgb = torch.rand(3, 10, 14)
+    wx, wy = compute_edge_weights(rgb)
+
+    grad_x = torch.abs(rgb[:, :, :-1] - rgb[:, :, 1:]).mean(0, keepdim=True)
+    grad_y = torch.abs(rgb[:, :-1, :] - rgb[:, 1:, :]).mean(0, keepdim=True)
+    assert torch.allclose(wx, torch.exp(-grad_x))
+    assert torch.allclose(wy, torch.exp(-grad_y))
+
+
+def test_edge_aware_logl1_loss_with_precomputed_weights_matches_fresh_computation():
+    pred = torch.rand(1, 12, 12) + 1.0
+    gt = torch.rand(1, 12, 12) + 1.0
+    rgb = torch.rand(3, 12, 12)
+    mask = torch.ones(1, 12, 12, dtype=torch.bool)
+
+    loss_fresh = edge_aware_logl1_loss(pred, gt, rgb, mask)
+    loss_cached = edge_aware_logl1_loss(pred, gt, rgb, mask, weights=compute_edge_weights(rgb))
+    assert torch.allclose(loss_fresh, loss_cached)
+
+
+def test_depth_loss_fn_accepts_optional_weights_kwarg_for_every_variant():
+    # weights is only consumed by edgeaware_logl1; the other variants must
+    # accept and ignore it so train.py can pass it unconditionally.
+    gt = torch.ones(1, 8, 8)
+    pred = gt + 0.5
+    rgb = torch.rand(3, 8, 8)
+    m = torch.ones(1, 8, 8, dtype=torch.bool)
+    weights = compute_edge_weights(rgb)
+
+    for name in ("edgeaware_logl1", "logl1", "l1", "huber"):
+        loss = depth_loss_fn(name)(pred, gt, rgb, m, weights=weights)
+        assert torch.isfinite(loss)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_camera_caches_depth_edge_weights_matching_fresh_computation():
+    from scene.cameras import Camera
+
+    image = torch.rand(3, 16, 16)
+    cam = Camera(colmap_id=0, R=np.eye(3), T=np.zeros(3), FoVx=1.0, FoVy=1.0,
+                 image=image, gt_alpha_mask=None, image_name="test", uid=0)
+
+    wx_cached, wy_cached = cam.get_depth_edge_weights()
+    wx_fresh, wy_fresh = compute_edge_weights(cam.original_image.cuda())
+    assert torch.allclose(wx_cached, wx_fresh)
+    assert torch.allclose(wy_cached, wy_fresh)
+
+    # Second call must reuse the cached tensors, not recompute them.
+    wx_again, wy_again = cam.get_depth_edge_weights()
+    assert wx_again is wx_cached
+    assert wy_again is wy_cached

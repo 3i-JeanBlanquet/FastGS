@@ -34,11 +34,7 @@ except ImportError:
 from utils.fast_utils import compute_gaussian_score_fastgs, sampling_cameras
 
 
-_depth_mask_logged = False
-
-
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, websockets):
-    global _depth_mask_logged
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
@@ -119,14 +115,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             alpha = render_pkg["alpha"]
             gt_depth = viewpoint_cam.sensor_depth.to(pred_depth.device).float()
             sensor_mask = viewpoint_cam.depth_mask.to(alpha.device)
+            # alpha is the current render's coverage, so this mask MUST be
+            # rebuilt every iteration -- it is not camera-invariant like the
+            # edge weights below.
             depth_mask = depth_supervision_mask(sensor_mask, alpha)
-            if not _depth_mask_logged:
+            if iteration == 1 or iteration % 1000 == 0:
                 frac = depth_mask.float().mean().item()
-                print("[depth] surviving supervision mask fraction (sensor & alpha>0.95): "
-                      "{:.4f}".format(frac))
-                _depth_mask_logged = True
+                print("[depth] surviving supervision mask fraction (sensor & alpha>0.95) "
+                      "@ iter {}: {:.4f}".format(iteration, frac))
+            depth_weights = None
+            if opt.depth_loss == "edgeaware_logl1":
+                # rgb (gt_image) is static per camera for the whole run, so the
+                # exp(-|grad rgb|) weights are cached on the Camera the first
+                # time it's used instead of recomputed every iteration.
+                depth_weights = viewpoint_cam.get_depth_edge_weights()
             Ldepth = depth_loss_fn(opt.depth_loss)(
-                pred_depth, gt_depth, gt_image, depth_mask)
+                pred_depth, gt_depth, gt_image, depth_mask, weights=depth_weights)
             loss = loss + opt.lambda_depth * Ldepth
 
         loss.backward()
