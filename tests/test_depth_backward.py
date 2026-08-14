@@ -17,10 +17,14 @@
 # GPU box, and a module-level import would break collection everywhere else.
 #
 
+import math
+
+import numpy as np
 import pytest
 import torch
 
-from tests.test_render_depth import CROWD, TILE, _crowded_scene, _one_gaussian, _render_crowd, _settings
+from tests.test_render_depth import CROWD, FOV, TILE, ZFAR, ZNEAR, _crowded_scene, _one_gaussian, _render_crowd, _settings
+from utils.graphics_utils import getProjectionMatrix, getWorld2View2
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -56,6 +60,112 @@ def test_position_gradient_matches_finite_difference():
         lo = _rendered_depth_sum(3.0 - eps)[0].item()
     numeric = (hi - lo) / (2 * eps)
     assert abs(analytic - numeric) / max(abs(numeric), 1e-3) < 0.05
+
+
+# --------------------------------------------------------------------------
+# Path 1 under a camera that is actually rotated.
+#
+# `z_view = V[2]*x + V[6]*y + V[10]*z + V[14]`, so the depth gradient reaches
+# position through the THIRD ROW of the view matrix, which in the flattened
+# column-major layout is (V[2], V[6], V[10]). Reading the third column,
+# (V[8], V[9], V[10]), is the natural transposition mistake -- and every other
+# test in this suite builds the camera as getWorld2View2(eye(3), 0), where the
+# view matrix is the identity, both readings equal (0, 0, 1) and only V[10] = 1
+# is exercised. Such a test cannot tell the two apart. This one can.
+# --------------------------------------------------------------------------
+
+
+def _two_axis_rotation():
+    """A rotation whose third row and third column differ substantially."""
+    ax, ay = 0.6, 0.4
+    rx = np.array([[1.0, 0.0, 0.0],
+                   [0.0, math.cos(ax), -math.sin(ax)],
+                   [0.0, math.sin(ax), math.cos(ax)]])
+    ry = np.array([[math.cos(ay), 0.0, math.sin(ay)],
+                   [0.0, 1.0, 0.0],
+                   [-math.sin(ay), 0.0, math.cos(ay)]])
+    return rx.dot(ry)
+
+
+def _rotated_settings(R, W=64, H=64):
+    from diff_gaussian_rasterization_fastgs import GaussianRasterizationSettings
+
+    world_view_transform = torch.tensor(
+        getWorld2View2(R, np.zeros(3), np.array([0.0, 0.0, 0.0]), 1.0)).transpose(0, 1).cuda()
+    projection_matrix = getProjectionMatrix(ZNEAR, ZFAR, FOV, FOV).transpose(0, 1).cuda()
+    full_proj_transform = (world_view_transform.unsqueeze(0).bmm(
+        projection_matrix.unsqueeze(0))).squeeze(0)
+    camera_center = world_view_transform.inverse()[3, :3]
+
+    tan = math.tan(FOV * 0.5)
+    return GaussianRasterizationSettings(
+        image_height=H,
+        image_width=W,
+        tanfovx=tan,
+        tanfovy=tan,
+        bg=torch.zeros(3, device="cuda"),
+        scale_modifier=1.0,
+        viewmatrix=world_view_transform,
+        projmatrix=full_proj_transform,
+        sh_degree=0,
+        campos=camera_center,
+        mult=0.5,
+        prefiltered=False,
+        debug=False,
+        get_flag=False,
+        metric_map=torch.zeros(H * W, dtype=torch.int, device="cuda"))
+
+
+def test_rotated_camera_exercises_more_than_v10():
+    """Without this the test below would be testing nothing new."""
+    R = _two_axis_rotation()
+    v = getWorld2View2(R, np.zeros(3), np.array([0.0, 0.0, 0.0]), 1.0).T.reshape(-1)
+    correct = (v[2], v[6], v[10])
+    transposed = (v[8], v[9], v[10])
+    assert abs(correct[0]) > 0.3 and abs(correct[1]) > 0.3, \
+        "V[2] and V[6] must be well clear of zero, else the indexing is untested"
+    assert max(abs(a - b) for a, b in zip(correct, transposed)) > 0.5, \
+        "the third row and third column must differ, else transposing is a no-op"
+
+
+def test_position_gradient_matches_finite_difference_under_a_rotated_camera():
+    from diff_gaussian_rasterization_fastgs import GaussianRasterizer
+
+    R = _two_axis_rotation()
+    settings = _rotated_settings(R)
+    # The camera sits at the world origin looking down its own +z, so the world
+    # point at view-space depth 3 is 3 * (third column of R).
+    centre = torch.tensor(3.0 * R[:, 2], dtype=torch.float32, device="cuda").reshape(1, 3)
+
+    def rendered(delta, requires_grad):
+        g = _one_gaussian(z=3.0)
+        g["means3D"] = (centre + delta).clone().requires_grad_(requires_grad)
+        out = GaussianRasterizer(settings)(**g)
+        return out[3].sum(), g["means3D"]
+
+    zero = torch.zeros((1, 3), device="cuda")
+    total, means = rendered(zero, True)
+    assert total.item() > 0.0, "the splat must be in front of the rotated camera"
+    total.backward()
+    analytic = means.grad[0].clone()
+
+    eps = 0.05
+    for axis in range(3):
+        numeric = []
+        for sign in (+1.0, -1.0):
+            delta = torch.zeros((1, 3), device="cuda")
+            delta[0, axis] = sign * eps
+            with torch.no_grad():
+                numeric.append(rendered(delta, False)[0].item())
+        finite_difference = (numeric[0] - numeric[1]) / (2 * eps)
+        # Score each component against the size of the whole gradient vector: a
+        # transposed read redistributes the gradient between x and y rather than
+        # rescaling any one component, and this catches that without letting a
+        # small component's own noise blow up the ratio.
+        scale = max(analytic.norm().item(), abs(finite_difference))
+        error = abs(analytic[axis].item() - finite_difference) / scale
+        assert error < 0.15, "axis {} analytic {:.4f} numeric {:.4f} rel {:.4f}".format(
+            axis, analytic[axis].item(), finite_difference, error)
 
 
 # --------------------------------------------------------------------------
@@ -117,6 +227,26 @@ def _depth_target(seed=7):
     return (2.0 + 3.0 * torch.rand((TILE, TILE), generator=g)).cuda()
 
 
+def _noise_floor(analytic):
+    """Comparison floor, scaled to the gradients this scene actually produces.
+
+    A splat whose own gradient is a thousandth of the scene's largest is in the
+    regime where the `alpha < 1/255` cutoff and the opacity-dependent tile
+    culling make the loss genuinely discontinuous, and a central difference
+    there measures a step rather than a derivative. Measured on splat 132 of
+    _crowded_scene, whose analytic gradient is -0.00067: the central difference
+    reads -0.0107 at eps=5e-3, +0.0007 at 1e-3 and exactly 0.0 at 2e-4 and
+    4e-5, i.e. it scales like step/(2*eps) instead of converging. A
+    well-conditioned splat in the same scene (132 -> 22, analytic -2.8109)
+    reads -2.8101 / -2.8121 / -2.8240 / -2.8246 across those same four epsilons.
+
+    So the floor is 2% of the largest gradient present rather than a constant
+    picked to fit one scene. It keeps its teeth: corrupting the replay puts the
+    error at the scale of the gradients themselves, which is 50x this.
+    """
+    return 0.02 * analytic.abs().max().item()
+
+
 def test_depth_opacity_gradients_survive_the_multi_bucket_replay():
     """The alpha path, checked against finite differences across buckets.
 
@@ -129,6 +259,7 @@ def test_depth_opacity_gradients_survive_the_multi_bucket_replay():
 
     _depth_loss(scene, target).backward()
     analytic = scene["opacities"].grad.clone().squeeze(1)
+    floor = _noise_floor(analytic)
 
     eps = 5e-3
     worst = 0.0
@@ -141,10 +272,7 @@ def test_depth_opacity_gradients_survive_the_multi_bucket_replay():
                 perturbed["opacities"][i, 0] += sign * eps
             numeric.append(_depth_loss(perturbed, target).item())
         finite_difference = (numeric[0] - numeric[1]) / (2 * eps)
-        # Floor the scale so near-zero gradients, where the finite difference is
-        # mostly quantisation noise from the alpha < 1/255 cutoff, cannot
-        # dominate the comparison.
-        scale = max(0.5, abs(analytic[i].item()), abs(finite_difference))
+        scale = max(floor, abs(analytic[i].item()), abs(finite_difference), 1e-9)
         worst = max(worst, abs(analytic[i].item() - finite_difference) / scale)
         checked += 1
 
@@ -196,6 +324,7 @@ def test_depth_position_gradients_survive_the_multi_bucket_replay():
 
     _depth_loss(scene, target).backward()
     analytic = scene["means3D"].grad[:, 2].clone()
+    floor = _noise_floor(analytic)
 
     worst = 0.0
     checked = 0
@@ -207,7 +336,7 @@ def test_depth_position_gradients_survive_the_multi_bucket_replay():
                 perturbed["means3D"][i, 2] += sign * Z_EPS
             numeric.append(_depth_loss(perturbed, target).item())
         finite_difference = (numeric[0] - numeric[1]) / (2 * Z_EPS)
-        scale = max(0.5, abs(analytic[i].item()), abs(finite_difference))
+        scale = max(floor, abs(analytic[i].item()), abs(finite_difference), 1e-9)
         worst = max(worst, abs(analytic[i].item() - finite_difference) / scale)
         checked += 1
 
@@ -215,12 +344,59 @@ def test_depth_position_gradients_survive_the_multi_bucket_replay():
     assert worst < 0.15, "worst relative gradient error {:.4f}".format(worst)
 
 
+# --------------------------------------------------------------------------
+# Resolutions the tile grid does not divide.
+#
+# BLOCK_X == BLOCK_Y == 16, so at 70x70 the grid of 5x5 tiles overhangs the
+# image by 10 pixels on each far edge. The backward stages 32 pixels at a time
+# out of `pixel_depths` -- which is the forward's `out_depth`, a bare {H, W}
+# tensor with no trailing slack -- and an overhanging pixel indexes past its
+# end. Every other test in this suite and in test_render_depth.py renders at
+# 64x64 or 16x16, where the grid lands exactly on the image, which is precisely
+# why nothing caught it.
+#
+# The overhanging values are never consumed (the consume path requires
+# valid_pixel), so this test cannot fail on the arithmetic; it exists to give
+# compute-sanitizer a workload that touches the clipped tiles, and to keep a
+# non-aligned resolution permanently exercised.
+# --------------------------------------------------------------------------
+
+# 16 divides neither 70 nor 100, and does divide 48, so these cover the
+# overhang on each axis independently as well as on both at once.
+RAGGED = [(70, 70), (100, 48), (48, 100)]
+
+
+@pytest.mark.parametrize("W,H", RAGGED)
+def test_depth_backward_at_a_resolution_the_tile_grid_does_not_divide(W, H):
+    from diff_gaussian_rasterization_fastgs import GaussianRasterizer
+
+    g = _one_gaussian(z=3.0, scale=5.0)
+    g["means3D"] = g["means3D"].clone().requires_grad_(True)
+    g["opacities"] = g["opacities"].clone().requires_grad_(True)
+
+    out = GaussianRasterizer(_settings(W=W, H=H))(**g)
+    depth, alpha = out[3], out[4]
+    assert depth.shape == (H, W)
+    # The far corner sits in a tile the grid only partly covers. Without this
+    # the clipped tiles might never be rasterised and the test would be inert.
+    assert alpha[-1, -1] > 0.5, "the splat must reach the clipped edge tiles"
+
+    depth.sum().backward()
+    assert g["means3D"].grad[0, 2].abs() > 1e-6
+    assert g["opacities"].grad.abs().sum() > 1e-6
+
+
 def test_colour_and_depth_gradients_add_up():
     """A combined loss must give exactly the sum of the two separate gradients.
 
     Guards the wiring rather than the maths: if the depth channel leaked into
-    the colour replay, or the colour background term were applied to the depth
-    channel, the two would stop being additive.
+    the colour replay -- crosstalk in ar[], in the shfl_up pipeline or in the
+    shared staging -- the two would stop being additive.
+
+    It does NOT cover the missing background term for the depth channel, which
+    is a separate correctness property: every test here sets bg=zeros(3), so
+    bg_dot_dpixel is identically 0 and applying it to the depth channel would
+    change nothing. That would need a non-zero background to test.
     """
     from diff_gaussian_rasterization_fastgs import GaussianRasterizer
 

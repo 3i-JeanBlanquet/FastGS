@@ -520,11 +520,13 @@ PerGaussianRenderCUDA(
   	#pragma unroll
 	for (int i = 0; i < BLOCK_SIZE + 31; ++i) {
     // Only pixels [i, i + 31] are staged, and a pixel is consumed below by the
-    // thread with `idx = i - thread_rank` in [0, BLOCK_SIZE), so nothing loaded
-    // at i >= BLOCK_SIZE is ever read. Skipping those rounds keeps every index
-    // below in range: with i <= BLOCK_SIZE - 32 the highest sampled_ar offset is
+    // thread with `idx = i - thread_rank` in [0, BLOCK_SIZE), so nothing staged
+    // at i >= BLOCK_SIZE is ever read. Both bounds below rely on skipping those
+    // rounds, which makes this guard load-bearing for memory safety rather than
+    // a tidy-up: with i <= BLOCK_SIZE - 32 the highest sampled_ar offset is
     // BLOCK_SIZE * C + (BLOCK_SIZE - 1), the last slot of this bucket's depth
-    // channel, and the highest pixel offset is the last pixel of the tile.
+    // channel, and local_id stays inside the tile instead of running 31 pixels
+    // past it and dragging the read below out of the image with it.
     if (i % 32 == 0 && i < BLOCK_SIZE) {
       for (int ch = 0; ch < C + 1; ++ch) {
         int shift = BLOCK_SIZE * ch + i + block.thread_rank();
@@ -532,11 +534,19 @@ PerGaussianRenderCUDA(
       }
       const uint32_t local_id = i + block.thread_rank();
       const uint2 pix = {pix_min.x + local_id % BLOCK_X, pix_min.y + local_id / BLOCK_X};
-      const uint32_t id = W * pix.y + pix.x;
-      for (int ch = 0; ch < C; ++ch) {
-        Shared_pixels[ch * 32 + block.thread_rank()] = pixel_colors[ch * H * W + id];
+      // The tile grid overhangs the image whenever BLOCK_X does not divide W or
+      // BLOCK_Y does not divide H, so a staged pixel can lie outside it. Those
+      // slots are never consumed -- the work loop below requires valid_pixel --
+      // but staging them still reads past the end of the source buffers, and
+      // pixel_depths is the forward's out_depth, a bare {H, W} tensor with no
+      // trailing slack to absorb it.
+      if (pix.x < W && pix.y < H) {
+        const uint32_t id = W * pix.y + pix.x;
+        for (int ch = 0; ch < C; ++ch) {
+          Shared_pixels[ch * 32 + block.thread_rank()] = pixel_colors[ch * H * W + id];
+        }
+        Shared_pixels[C * 32 + block.thread_rank()] = pixel_depths[id];
       }
-      Shared_pixels[C * 32 + block.thread_rank()] = pixel_depths[id];
       block.sync();
     }
 
