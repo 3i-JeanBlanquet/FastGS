@@ -110,6 +110,35 @@ monocular predictors emit it; on bounded metric depth an inverse-depth L1 would 
 chair at 1 m about 64× more than a wall at 8 m — backwards, since walls and floors are
 where the floaters live.
 
+## Does it work?
+
+Held-out evaluation on the reference capture (112 images, 30000 iterations, `--eval` holds
+out every 8th camera; 14 test views, 12 contributing valid pixels in every run):
+
+| model | splats | depth MAE | depth RMSE | PSNR | SSIM | mask coverage |
+|---|---:|---:|---:|---:|---:|---:|
+| baseline (RGB only) | 101,410 | **2.52 m** | 3.25 m | 23.43 | 0.868 | 88.8% |
+| `--depths` (sparse init) | 102,003 | **0.72 m** | 1.34 m | 23.56 | 0.872 | 86.7% |
+| `--depths --init_from_depth` | 280,205 | **0.72 m** | 1.33 m | 23.23 | 0.860 | 88.8% |
+
+**Depth error falls 3.5× while PSNR moves 0.13 dB.** That gap is the entire argument for this
+work: photometric metrics cannot see the geometry problem, so a scene full of floaters scores
+well on PSNR. Measure depth error, or you are not measuring what you set out to fix.
+
+Coverage is comparable across all three (86.7–88.8% of pixels), so the comparison is like for
+like rather than one model being scored only where it is already confident.
+
+### Recommended configuration: `--depths` alone
+
+Dense initialisation buys **no additional depth accuracy** (0.7178 vs 0.7168 m MAE — a 1 mm
+difference) while costing 2.7× the splats, 2.8× the PLY size, and slightly *worse* PSNR and
+SSIM. Use `--init_from_depth` only if you specifically want a denser cloud for another reason.
+
+This contradicts the original design's expectation on two counts, both worth recording: depth
+supervision did not reduce Gaussian count (it was flat), and dense initialisation — predicted
+to be independently valuable — turned out to be the expensive half with no measured geometric
+benefit on this capture.
+
 ## Performance
 
 Measured on an RTX 6000 Ada, 500k Gaussians at 1024×1024, 12 interleaved repetitions per
@@ -138,20 +167,38 @@ Medians are quoted for that reason.
 The microbenchmark above measures the rasterizer in isolation and **understates real cost**.
 Full 30000-iteration runs on the reference capture (112 images at 1024², RTX 6000 Ada):
 
+Measured back to back on the same box under identical load, with both optimisations below
+applied:
+
 | configuration | splats | training time | vs baseline |
 |---|---|---|---|
-| baseline (RGB only) | 101,410 | 80.2 s | — |
-| `--depths`, COLMAP sparse init | 101,178 | 132.3 s | **+65%** |
-| `--depths --init_from_depth` | 280,205 | 191.8 s | +139% |
+| baseline (RGB only) | 100,274 | 114.98 s | — |
+| `--depths` | 100,772 | 148.87 s | **+29.5%** |
 
-Two separate effects, worth keeping apart when deciding what to enable.
+Absolute times vary with what else is running on that machine; run baseline and depth
+back to back and compare the ratio, never absolute times from different sessions.
 
-**The depth loss costs +52 s, and 91% of that is Python, not CUDA.** The kernel overhead
-accounts for only 0.153 ms/iter ≈ 4.6 s across the run. The remaining ~47 s is the loss
-itself — roughly 1.58 ms per iteration of elementwise gradient, exp and masking work over a
-full-resolution image. Splat count is unchanged (−0.2%), so it is pure per-iteration cost,
-and therefore addressable: the edge weights `exp(−|∇RGB|)` depend only on the static
-ground-truth image and need not be recomputed every step.
+Two optimisations took this from +65% to +29.5%, and the route to them is worth recording
+because the first attempt was based on a wrong inference:
+
+**Attribution by subtraction is not profiling.** Subtracting a rasterizer microbenchmark from
+the end-to-end delta suggested ~91% of the cost was recomputing the edge weights each
+iteration. Caching them (they depend only on the static ground-truth image) recovered just
+3.7%. Direct profiling of the loss found the real culprit: **boolean-mask advanced indexing**,
+`logl1[mask]`, at 0.256 ms/iter — half the entire loss. PyTorch must learn the output size
+before allocating, forcing a device→host sync every call. Rewriting as multiply-and-normalise
+is bit-identical (relative difference 0.00e+00) and drops the loss from 0.513 to 0.151 ms.
+
+| loss component (1024²) | ms/iter |
+|---|---|
+| fp16 → float cast | 0.013 |
+| alpha mask construction | 0.029 |
+| `log1p(|pred−gt|)` | 0.027 |
+| **boolean-mask index** | **0.256** |
+| same via multiply | 0.043 |
+
+Dense initialisation remains the expensive option: it nearly triples splat count
+(101k → 280k) and PLY size (25 MB → 69 MB) for no measured depth-accuracy gain.
 
 **Dense initialisation is the expensive part, and it changes the output.** It nearly triples
 the splat count (101k → 280k) and the PLY size (25 MB → 69 MB). Note this contradicts the
@@ -203,13 +250,13 @@ Depth is uint16 PNG in millimetres, `0 = invalid`, same resolution as its image.
 
 ## Known limitations and open questions
 
-**The alpha threshold interacts strongly with initialisation.** Rendered depth is
-*unnormalised* — where coverage is partial it under-reports distance, so the loss masks on
-`alpha > 0.95`. How much survives that mask depends heavily on how training was seeded:
-**96.2%** with `--init_from_depth`, but only **10.7%** with COLMAP sparse init at the same
-early iteration. With sparse init, depth supervision starts out acting on a tenth of the
-image. The threshold looks right for the dense-init path; if you run with sparse init, check
-the logged mask fraction before concluding depth supervision "didn't help".
+**The alpha threshold is settled, but takes time to earn coverage with sparse init.** Rendered
+depth is *unnormalised* — where coverage is partial it under-reports distance, so the loss
+masks on `alpha > 0.95`. With `--init_from_depth` coverage is 96% from the first iteration.
+With COLMAP sparse init it starts at 10.7%, but climbs through training to 0.70–0.99
+(averaging ~0.9) and reaches 86.7% mean coverage on held-out views by 30k. Both paths end up
+supervising nearly the whole image; sparse init simply gets there later. The training loop
+logs this fraction every 1000 iterations so a genuinely degenerate mask stays visible.
 
 **Depth-guided densification and pruning is deliberately not implemented.** Feeding depth
 consistency into FastGS's `compute_gaussian_score_fastgs` is the right eventual answer for
