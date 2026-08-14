@@ -109,7 +109,7 @@ class OptimizationParams(ParamGroup):
         self.optimizer_type = "default"
 
         # depth supervision
-        self.lambda_depth = 0.2
+        self.lambda_depth = 0.5
         self.depth_from_iter = 0
         self.depth_loss = "edgeaware_logl1"
         super().__init__(parser, "Optimization Parameters")

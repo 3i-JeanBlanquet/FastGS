@@ -128,16 +128,41 @@ well on PSNR. Measure depth error, or you are not measuring what you set out to 
 Coverage is comparable across all three (86.7–88.8% of pixels), so the comparison is like for
 like rather than one model being scored only where it is already confident.
 
-### Recommended configuration: `--depths` alone
+### Geometric accuracy against the sensor point cloud
 
-Dense initialisation buys **no additional depth accuracy** (0.7178 vs 0.7168 m MAE — a 1 mm
-difference) while costing 2.7× the splats, 2.8× the PLY size, and slightly *worse* PSNR and
-SSIM. Use `--init_from_depth` only if you specifically want a denser cloud for another reason.
+Depth MAE has a blind spot: it only scores pixels visible from test cameras, so a floater
+hidden behind correct geometry never appears in it. Measuring every splat centre against the
+capture's own sensor point cloud (145,839 points, same COLMAP frame, 5.2 cm spacing — the best
+any model could score) sees them all:
 
-This contradicts the original design's expectation on two counts, both worth recording: depth
-supervision did not reduce Gaussian count (it was flat), and dense initialisation — predicted
-to be independently valuable — turned out to be the expensive half with no measured geometric
-benefit on this capture.
+| configuration | splats | median distance | >25 cm | **floaters >1 m** |
+|---|---:|---:|---:|---:|
+| baseline (RGB only) | 100,274 | 0.659 m | 78.7% | **33.5%** |
+| `--depths`, λ=0.2 | 100,772 | 0.416 m | 67.4% | 16.0% |
+| `--depths`, λ=0.5 | 119,894 | 0.373 m | 64.2% | 13.8% |
+| `--depths --init_from_depth`, λ=0.2 | 280,205 | 0.279 m | 54.4% | 6.7% |
+| **`--depths --init_from_depth`, λ=0.5** | **268,409** | **0.256 m** | **51.0%** | **6.1%** |
+| `--depths --init_from_depth`, λ=1.0 | 273,171 | 0.249 m | 49.9% | 7.1% |
+
+Scored inside the reference cloud's bounding box; outside it there is no ground truth, so
+distances there would measure coverage rather than error.
+
+**Recommended: `--depths --init_from_depth --lambda_depth 0.5`.** Floaters fall 33.5% → 6.1%,
+a 5.5× reduction, with slightly *fewer* splats than λ=0.2.
+
+Two findings here corrected earlier conclusions drawn from depth MAE alone:
+
+**Dense initialisation matters, and MAE could not see it.** At matched splat count (~280k),
+dense init gives 6.7% floaters against sparse init's 13.7% — half — while their depth MAE
+differed by 1 mm. Hidden floaters are invisible to a view-based metric by construction.
+
+**λ_depth saturates early.** Floaters plateau at ~13.7% (sparse) / ~6% (dense) from λ=0.5
+onward, while splat count keeps climbing — 5.4× more splats at λ=5.0 for no geometric gain.
+The mechanism: the depth gradient feeds the same screen-space signal FastGS uses to trigger
+densification, so a heavier depth weight simply splits more aggressively.
+
+The original design's expectation that depth supervision would *reduce* Gaussian count did not
+hold in any configuration.
 
 ## Performance
 
@@ -226,7 +251,7 @@ python train.py -s /path/to/scene -m /path/to/output \
 |---|---|---|
 | `--depths` | `""` | enable depth supervision (any non-empty value) |
 | `--depth_scale_file` | `<model>/depth_scale.json` | calibration from stage 1 |
-| `--lambda_depth` | `0.2` | depth loss weight (matches dn-splatter) |
+| `--lambda_depth` | `0.5` | depth loss weight (tuned; see sweep above) |
 | `--depth_loss` | `edgeaware_logl1` | `edgeaware_logl1` \| `logl1` \| `l1` \| `huber` |
 | `--depth_max` | `30.0` | metres; reject beyond |
 | `--depth_from_iter` | `0` | delay depth supervision |
