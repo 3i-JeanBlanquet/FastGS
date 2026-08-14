@@ -133,13 +133,18 @@ def edge_aware_logl1_loss(pred, gt, rgb, mask, weights=None):
     wx, wy = weights if weights is not None else compute_edge_weights(rgb)
 
     mx, my = mask[:, :, :-1], mask[:, :-1, :]
-    lx = (logl1[:, :, :-1] * wx)[mx]
-    ly = (logl1[:, :-1, :] * wy)[my]
-
-    n = lx.numel() + ly.numel()
-    if n == 0:
-        return torch.zeros((), device=pred.device, dtype=pred.dtype)
-    return (lx.sum() + ly.sum()) / n
+    # Multiply-and-normalise instead of boolean-mask advanced indexing
+    # (`tensor[bool_mask]`): the gather form has to learn its data-dependent
+    # output size before it can allocate, which forces a device->host sync on
+    # every call. Multiplying by the mask and summing is equivalent -- masked-
+    # out positions contribute exactly 0 -- and dividing by the (clamped)
+    # surviving count avoids the sync entirely. clamp(min=1) keeps a fully-
+    # false mask a finite zero rather than 0/0.
+    mx_f, my_f = mx.to(logl1.dtype), my.to(logl1.dtype)
+    sx = (logl1[:, :, :-1] * wx * mx_f).sum()
+    sy = (logl1[:, :-1, :] * wy * my_f).sum()
+    n = (mx.sum() + my.sum()).clamp(min=1)
+    return (sx + sy) / n
 
 
 def depth_loss_fn(name):
@@ -151,17 +156,24 @@ def depth_loss_fn(name):
     directly. A fully-false mask returns a finite zero rather than NaN.
     """
     def _masked(f):
+        # f must return an ELEMENTWISE (unreduced) tensor shaped like pred/gt --
+        # reduction happens here, over the mask, after f runs.
         def g(pred, gt, rgb, mask, weights=None):
-            if mask.sum() == 0:
-                return torch.zeros((), device=pred.device, dtype=pred.dtype)
-            return f(pred[mask], gt[mask])
+            # Multiply-and-normalise instead of `pred[mask]`/`gt[mask]` advanced
+            # indexing (and the `mask.sum() == 0` python-bool branch, which also
+            # syncs): both force a device->host sync to learn a data-dependent
+            # size/branch on every call. clamp(min=1) keeps a fully-false mask a
+            # finite zero rather than 0/0, matching the old early-return.
+            mask_f = mask.to(pred.dtype)
+            n = mask.sum().clamp(min=1)
+            return (f(pred, gt) * mask_f).sum() / n
         return g
 
     table = {
         "edgeaware_logl1": edge_aware_logl1_loss,
-        "logl1": _masked(lambda p, g: torch.log(1.0 + torch.abs(p - g)).mean()),
-        "l1": _masked(lambda p, g: torch.abs(p - g).mean()),
-        "huber": _masked(lambda p, g: F.smooth_l1_loss(p, g)),
+        "logl1": _masked(lambda p, g: torch.log(1.0 + torch.abs(p - g))),
+        "l1": _masked(lambda p, g: torch.abs(p - g)),
+        "huber": _masked(lambda p, g: F.smooth_l1_loss(p, g, reduction="none")),
     }
     if name not in table:
         raise ValueError("unknown --depth_loss {!r}; choose from {}".format(

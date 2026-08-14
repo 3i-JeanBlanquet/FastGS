@@ -13,6 +13,7 @@
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 
 from utils.loss_utils import (
     ALPHA_THRESHOLD,
@@ -209,3 +210,68 @@ def test_camera_caches_depth_edge_weights_matching_fresh_computation():
     wx_again, wy_again = cam.get_depth_edge_weights()
     assert wx_again is wx_cached
     assert wy_again is wy_cached
+
+
+# --- Sync-free masked reduction: multiply+normalise must match the old gather form
+#
+# `pred[mask]` / `gt[mask]` boolean-mask advanced indexing (and the
+# `mask.sum() == 0` python-bool branch guarding it) forces a device->host
+# synchronisation on every call, because torch has to learn the actual
+# data-dependent output size/branch before it can proceed. edge_aware_logl1_loss
+# and depth_loss_fn's other variants now multiply by the mask and normalise by
+# its count instead, which needs no such sync. These tests pin the new sync-free
+# reduction against the old gather form it replaced, on random partially-masked
+# data -- an optimisation that changes the loss value is a bug, not a speed-up.
+
+def _old_gather_edge_aware_logl1(pred, gt, rgb, mask):
+    logl1 = torch.log(1.0 + torch.abs(pred - gt))
+    wx, wy = compute_edge_weights(rgb)
+    mx, my = mask[:, :, :-1], mask[:, :-1, :]
+    lx = (logl1[:, :, :-1] * wx)[mx]
+    ly = (logl1[:, :-1, :] * wy)[my]
+    n = lx.numel() + ly.numel()
+    if n == 0:
+        return torch.zeros((), device=pred.device, dtype=pred.dtype)
+    return (lx.sum() + ly.sum()) / n
+
+
+def _old_gather_masked(f):
+    def g(pred, gt, rgb, mask):
+        if mask.sum() == 0:
+            return torch.zeros((), device=pred.device, dtype=pred.dtype)
+        return f(pred[mask], gt[mask])
+    return g
+
+
+_OLD_GATHER_TABLE = {
+    "edgeaware_logl1": _old_gather_edge_aware_logl1,
+    "logl1": _old_gather_masked(lambda p, g: torch.log(1.0 + torch.abs(p - g)).mean()),
+    "l1": _old_gather_masked(lambda p, g: torch.abs(p - g).mean()),
+    "huber": _old_gather_masked(lambda p, g: F.smooth_l1_loss(p, g)),
+}
+
+
+def test_sync_free_masked_reduction_matches_old_gather_form_for_every_variant():
+    torch.manual_seed(0)
+    gt = torch.rand(1, 20, 24) + 1.0
+    pred = gt + torch.randn(1, 20, 24) * 0.3
+    rgb = torch.rand(3, 20, 24)
+    mask = torch.rand(1, 20, 24) > 0.4  # a random, partial mask
+
+    for name in ("edgeaware_logl1", "logl1", "l1", "huber"):
+        old = _OLD_GATHER_TABLE[name](pred, gt, rgb, mask)
+        new = depth_loss_fn(name)(pred, gt, rgb, mask)
+        assert torch.allclose(old, new, atol=1e-6), name
+
+
+def test_sync_free_masked_reduction_matches_old_gather_form_when_fully_true():
+    torch.manual_seed(1)
+    gt = torch.rand(1, 8, 10) + 1.0
+    pred = gt + torch.randn(1, 8, 10) * 0.2
+    rgb = torch.rand(3, 8, 10)
+    mask = torch.ones(1, 8, 10, dtype=torch.bool)
+
+    for name in ("edgeaware_logl1", "logl1", "l1", "huber"):
+        old = _OLD_GATHER_TABLE[name](pred, gt, rgb, mask)
+        new = depth_loss_fn(name)(pred, gt, rgb, mask)
+        assert torch.allclose(old, new, atol=1e-6), name
