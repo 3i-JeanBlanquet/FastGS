@@ -106,7 +106,10 @@ class _RasterizeGaussians(torch.autograd.Function):
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
         ctx.num_buckets = num_buckets
-        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, geomBuffer, binningBuffer, imgBuffer, sampleBuffer)
+        # depth is kept because the backward replays the per-bucket depth
+        # accumulator against the final rendered depth, exactly as the colour
+        # replay uses the final rendered colour.
+        ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, depth)
         # Alpha is a diagnostic/masking output only -- no gradient flows through it.
         ctx.mark_non_differentiable(alpha)
         return color, radii, accum_metric_counts, depth, alpha
@@ -118,7 +121,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         num_rendered = ctx.num_rendered
         num_buckets = ctx.num_buckets
         raster_settings = ctx.raster_settings
-        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, geomBuffer, binningBuffer, imgBuffer, sampleBuffer = ctx.saved_tensors
+        colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, depth = ctx.saved_tensors
 
         # Restructure args as C++ method expects them
         args = (raster_settings.bg,
@@ -133,7 +136,9 @@ class _RasterizeGaussians(torch.autograd.Function):
                 raster_settings.projmatrix, 
                 raster_settings.tanfovx, 
                 raster_settings.tanfovy, 
-                grad_out_color, 
+                grad_out_color,
+                depth,
+                grad_out_depth,
                 dc,
                 sh, 
                 raster_settings.sh_degree, 

@@ -356,9 +356,11 @@ __global__ void preprocessCUDA(
 	const glm::vec3* scales,
 	const glm::vec4* rotations,
 	const float scale_modifier,
+	const float* view,
 	const float* proj,
 	const glm::vec3* campos,
 	const float4* dL_dmean2D,
+	const float* dL_ddepths,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
 	float* dL_dcov3D,
@@ -386,6 +388,14 @@ __global__ void preprocessCUDA(
 	dL_dmean.y = (proj[4] * m_w - proj[7] * mul1) * dL_dmean2D[idx].x + (proj[5] * m_w - proj[7] * mul2) * dL_dmean2D[idx].y;
 	dL_dmean.z = (proj[8] * m_w - proj[11] * mul1) * dL_dmean2D[idx].x + (proj[9] * m_w - proj[11] * mul2) * dL_dmean2D[idx].y;
 
+	// The depth a Gaussian contributes is the z of its view-space mean,
+	// z_view = V[2] * x + V[6] * y + V[10] * z + V[14], so the accumulated
+	// depth gradient slides the Gaussian along the view ray.
+	const float dL_ddepth = dL_ddepths[idx];
+	dL_dmean.x += dL_ddepth * view[2];
+	dL_dmean.y += dL_ddepth * view[6];
+	dL_dmean.z += dL_ddepth * view[10];
+
 	// That's the second part of the mean gradient. Previous computation
 	// of cov2D and following SH conversion also affects it.
 	dL_dmeans[idx] += dL_dmean;
@@ -412,15 +422,19 @@ PerGaussianRenderCUDA(
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
 	const float* __restrict__ colors,
+	const float* __restrict__ depths,
 	const float* __restrict__ final_Ts,
 	const uint32_t* __restrict__ n_contrib,
 	const uint32_t* __restrict__ max_contrib,
 	const float* __restrict__ pixel_colors,
+	const float* __restrict__ pixel_depths,
 	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ dL_dpixel_depths,
 	float4* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors
+	float* __restrict__ dL_dcolors,
+	float* __restrict__ dL_ddepths
 ) {
 	// global_bucket_idx = warp_idx
 	auto block = cg::this_thread_block();
@@ -456,12 +470,14 @@ PerGaussianRenderCUDA(
 	float2 xy = {0.0f, 0.0f};
 	float4 con_o = {0.0f, 0.0f, 0.0f, 0.0f};
 	float c[C] = {0.0f};
+	float depth = 0.0f;
 	if (valid_splat) {
 		gaussian_idx = point_list[splat_idx_global];
 		xy = points_xy_image[gaussian_idx];
 		con_o = conic_opacity[gaussian_idx];
 		for (int ch = 0; ch < C; ++ch)
 			c[ch] = colors[gaussian_idx * C + ch];
+		depth = depths[gaussian_idx];
 	}
 
 	// Gradient accumulation variables
@@ -474,7 +490,8 @@ PerGaussianRenderCUDA(
 	float Register_dL_dconic2D_w = 0.0f;
 	float Register_dL_dopacity = 0.0f;
 	float Register_dL_dcolors[C] = {0.0f};
-	
+	float Register_dL_ddepths = 0.0f;
+
 	// tile metadata
 	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
 	const uint2 tile = {tile_id % horizontal_blocks, tile_id / horizontal_blocks};
@@ -484,24 +501,32 @@ PerGaussianRenderCUDA(
 	float T;
 	float T_final;
 	float last_contributor;
-	float ar[C];
-	float dL_dpixel[C];
+	// Channel C is the depth channel: the forward accumulates it exactly like a
+	// colour channel, so it replays through the same machinery with a zero
+	// background.
+	float ar[C + 1];
+	float dL_dpixel[C + 1];
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
   // shared memory
-  __shared__ float Shared_sampled_ar[32 * C + 1];
+  __shared__ float Shared_sampled_ar[32 * (C + 1) + 1];
   // The forward pass checkpoints C colour channels plus one depth channel per
-  // bucket-thread, so the per-bucket stride is (C + 1), not C. The depth slot
-  // itself is not read here -- the backward depth gradient is not implemented.
+  // bucket-thread, so the per-bucket stride is (C + 1), not C.
   sampled_ar += global_bucket_idx * BLOCK_SIZE * (C + 1);
-  __shared__ float Shared_pixels[32 * C];
+  __shared__ float Shared_pixels[32 * (C + 1)];
 
 	// iterate over all pixels in the tile
   	#pragma unroll
 	for (int i = 0; i < BLOCK_SIZE + 31; ++i) {
-    if (i % 32 == 0) {
-      for (int ch = 0; ch < C; ++ch) {
+    // Only pixels [i, i + 31] are staged, and a pixel is consumed below by the
+    // thread with `idx = i - thread_rank` in [0, BLOCK_SIZE), so nothing loaded
+    // at i >= BLOCK_SIZE is ever read. Skipping those rounds keeps every index
+    // below in range: with i <= BLOCK_SIZE - 32 the highest sampled_ar offset is
+    // BLOCK_SIZE * C + (BLOCK_SIZE - 1), the last slot of this bucket's depth
+    // channel, and the highest pixel offset is the last pixel of the tile.
+    if (i % 32 == 0 && i < BLOCK_SIZE) {
+      for (int ch = 0; ch < C + 1; ++ch) {
         int shift = BLOCK_SIZE * ch + i + block.thread_rank();
         Shared_sampled_ar[ch * 32 + block.thread_rank()] = sampled_ar[shift];
       }
@@ -511,6 +536,7 @@ PerGaussianRenderCUDA(
       for (int ch = 0; ch < C; ++ch) {
         Shared_pixels[ch * 32 + block.thread_rank()] = pixel_colors[ch * H * W + id];
       }
+      Shared_pixels[C * 32 + block.thread_rank()] = pixel_depths[id];
       block.sync();
     }
 
@@ -521,7 +547,7 @@ PerGaussianRenderCUDA(
 		T = my_warp.shfl_up(T, 1);
 		last_contributor = my_warp.shfl_up(last_contributor, 1);
 		T_final = my_warp.shfl_up(T_final, 1);
-		for (int ch = 0; ch < C; ++ch) {
+		for (int ch = 0; ch < C + 1; ++ch) {
 			ar[ch] = my_warp.shfl_up(ar[ch], 1);
 			dL_dpixel[ch] = my_warp.shfl_up(dL_dpixel[ch], 1);
 		}
@@ -538,13 +564,14 @@ PerGaussianRenderCUDA(
 		if (valid_splat && valid_pixel && my_warp.thread_rank() == 0 && idx < BLOCK_SIZE) {
 			T = sampled_T[global_bucket_idx * BLOCK_SIZE + idx];
       		int ii = i % 32;
-			for (int ch = 0; ch < C; ++ch) 
+			for (int ch = 0; ch < C + 1; ++ch)
 				ar[ch] = -Shared_pixels[ch * 32 + ii] + Shared_sampled_ar[ch * 32 + ii];
 			T_final = final_Ts[pix_id];
 			last_contributor = n_contrib[pix_id];
 			for (int ch = 0; ch < C; ++ch) {
 				dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
 			}
+			dL_dpixel[C] = dL_dpixel_depths[pix_id];
 		}
 
 		// do work
@@ -571,6 +598,13 @@ PerGaussianRenderCUDA(
 				Register_dL_dcolors[ch] += dchannel_dcolor * dL_dchannel;
 				dL_dalpha += (c[ch] * T + one_minus_alpha_reci * ar[ch]) * dL_dchannel;
 			}
+			// Depth channel. Identical structure to a colour channel -- the
+			// per-Gaussian "colour" is its view-space depth and the background
+			// is zero, so it contributes no background term below.
+			ar[C] += dchannel_dcolor * depth;
+			const float &dL_dD = dL_dpixel[C];
+			Register_dL_ddepths += dchannel_dcolor * dL_dD;
+			dL_dalpha += (depth * T + one_minus_alpha_reci * ar[C]) * dL_dD;
 			float bg_dot_dpixel = 0.0f;
 			for (int ch = 0; ch < C; ++ch) {
 				bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
@@ -618,6 +652,7 @@ PerGaussianRenderCUDA(
 		for (int ch = 0; ch < C; ++ch) {
 			atomicAdd(&dL_dcolors[gaussian_idx * C + ch], Register_dL_dcolors[ch]);
 		}
+		atomicAdd(&dL_ddepths[gaussian_idx], Register_dL_ddepths);
 	}
 }
 
@@ -804,6 +839,7 @@ void BACKWARD::preprocess(
 	const glm::vec3* campos,
 	const float4* dL_dmean2D,
 	const float* dL_dconic,
+	const float* dL_ddepths,
 	glm::vec3* dL_dmean3D,
 	float* dL_dcolor,
 	float* dL_dcov3D,
@@ -843,9 +879,11 @@ void BACKWARD::preprocess(
 		(glm::vec3*)scales,
 		(glm::vec4*)rotations,
 		scale_modifier,
+		viewmatrix,
 		projmatrix,
 		campos,
 		(float4*)dL_dmean2D,
+		dL_ddepths,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
@@ -867,15 +905,19 @@ void BACKWARD::render(
 	const float2* means2D,
 	const float4* conic_opacity,
 	const float* colors,
+	const float* depths,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
 	const uint32_t* max_contrib,
 	const float* pixel_colors,
+	const float* pixel_depths,
 	const float* dL_dpixels,
+	const float* dL_dpixel_depths,
 	float4* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
-	float* dL_dcolors)
+	float* dL_dcolors,
+	float* dL_ddepths)
 {
 	const int THREADS = 32;
 	PerGaussianRenderCUDA<NUM_CHAFFELS> <<<((B*32) + THREADS - 1) / THREADS,THREADS>>>(
@@ -889,14 +931,18 @@ void BACKWARD::render(
 		means2D,
 		conic_opacity,
 		colors,
+		depths,
 		final_Ts,
 		n_contrib,
 		max_contrib,
 		pixel_colors,
+		pixel_depths,
 		dL_dpixels,
+		dL_dpixel_depths,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,
-		dL_dcolors
+		dL_dcolors,
+		dL_ddepths
 		);
 }
