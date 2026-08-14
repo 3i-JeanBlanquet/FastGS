@@ -131,8 +131,38 @@ pays whether or not they supervise on depth.
 Read the memory figures as solid and the timings as approximate. Memory is deterministic.
 The timing distribution is noisy (pooled σ ≈ 0.70 ms) because the benchmark box also runs
 production containers — the mean sits far above the median, the signature of contention.
-Medians are quoted for that reason. The honest summary is **single-digit percent slower,
-~15% more rasterizer memory**.
+Medians are quoted for that reason.
+
+### End-to-end, which is the number that actually matters
+
+The microbenchmark above measures the rasterizer in isolation and **understates real cost**.
+Full 30000-iteration runs on the reference capture (112 images at 1024², RTX 6000 Ada):
+
+| configuration | splats | training time | vs baseline |
+|---|---|---|---|
+| baseline (RGB only) | 101,410 | 80.2 s | — |
+| `--depths`, COLMAP sparse init | 101,178 | 132.3 s | **+65%** |
+| `--depths --init_from_depth` | 280,205 | 191.8 s | +139% |
+
+Two separate effects, worth keeping apart when deciding what to enable.
+
+**The depth loss costs +52 s, and 91% of that is Python, not CUDA.** The kernel overhead
+accounts for only 0.153 ms/iter ≈ 4.6 s across the run. The remaining ~47 s is the loss
+itself — roughly 1.58 ms per iteration of elementwise gradient, exp and masking work over a
+full-resolution image. Splat count is unchanged (−0.2%), so it is pure per-iteration cost,
+and therefore addressable: the edge weights `exp(−|∇RGB|)` depend only on the static
+ground-truth image and need not be recomputed every step.
+
+**Dense initialisation is the expensive part, and it changes the output.** It nearly triples
+the splat count (101k → 280k) and the PLY size (25 MB → 69 MB). Note this contradicts the
+original design's expectation that depth supervision would *reduce* Gaussian count — with
+sparse init the count is flat, and with dense init it rises sharply, because the count is
+dominated by initialisation rather than by the loss. If PLY weight matters more to you than
+initial geometry, run with `--depths` alone.
+
+Dense init does pay for itself in one respect: the surviving supervision mask is **96.2%**
+with it versus **10.7%** without at the same early iteration, because dense coverage raises
+alpha immediately. The two features reinforce each other.
 
 ## Usage
 
@@ -173,12 +203,13 @@ Depth is uint16 PNG in millimetres, `0 = invalid`, same resolution as its image.
 
 ## Known limitations and open questions
 
-**The alpha threshold is unresolved.** Rendered depth is *unnormalised* — where coverage is
-partial it under-reports distance, so the loss masks on `alpha > 0.95`. At iteration 300 on
-the reference capture only 21% of pixels survive that mask. Early training is the worst
-possible sampling point (sparse cloud, minimal coverage), and the fraction should climb
-substantially by 30k — but it must be re-measured late in training before 0.95 is accepted.
-If it stays low, depth supervision is quietly acting on a fifth of the image.
+**The alpha threshold interacts strongly with initialisation.** Rendered depth is
+*unnormalised* — where coverage is partial it under-reports distance, so the loss masks on
+`alpha > 0.95`. How much survives that mask depends heavily on how training was seeded:
+**96.2%** with `--init_from_depth`, but only **10.7%** with COLMAP sparse init at the same
+early iteration. With sparse init, depth supervision starts out acting on a tenth of the
+image. The threshold looks right for the dense-init path; if you run with sparse init, check
+the logged mask fraction before concluding depth supervision "didn't help".
 
 **Depth-guided densification and pruning is deliberately not implemented.** Feeding depth
 consistency into FastGS's `compute_gaussian_score_fastgs` is the right eventual answer for
