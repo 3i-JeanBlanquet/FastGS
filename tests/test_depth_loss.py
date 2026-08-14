@@ -380,19 +380,21 @@ def _optimization_args(argv):
     return op.extract(parser.parse_args(argv))
 
 
-def test_depth_normalize_defaults_to_true():
-    assert _optimization_args([]).depth_normalize is True
+def test_depth_normalize_defaults_to_false():
+    # Measured on the reference capture: normalisation moved surface opacity
+    # 0.450 -> 0.425 and floaters 6.1% -> 6.5%. Default follows the measurement.
+    assert _optimization_args([]).depth_normalize is False
 
 
-def test_depth_normalize_can_be_switched_off():
-    assert _optimization_args(["--depth_normalize", "False"]).depth_normalize is False
-    assert _optimization_args(["--depth_normalize", "false"]).depth_normalize is False
-    assert _optimization_args(["--depth_normalize", "0"]).depth_normalize is False
+def test_depth_normalize_is_off_unless_asked_for():
+    # Now that the default is False, ParamGroup registers it as a bare
+    # store_true flag, so absence means un-normalised supervision.
+    assert _optimization_args([]).depth_normalize is False
+    assert _optimization_args(["--lambda_depth", "0.25"]).depth_normalize is False
 
 
-def test_depth_normalize_bare_flag_still_means_true():
+def test_depth_normalize_bare_flag_turns_it_on():
     assert _optimization_args(["--depth_normalize"]).depth_normalize is True
-    assert _optimization_args(["--depth_normalize", "True"]).depth_normalize is True
 
 
 def test_depth_normalize_does_not_swallow_the_next_option():

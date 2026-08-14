@@ -142,11 +142,14 @@ class OptimizationParams(ParamGroup):
         self.lambda_depth = 0.5
         self.depth_from_iter = 0
         self.depth_loss = "edgeaware_logl1"
-        # Supervise D / A rather than raw D. On by default: raw D lets the
-        # optimiser cut depth error by fading splats instead of moving them,
-        # which hollows out surfaces. `--depth_normalize False` restores the
-        # old un-normalised behaviour for comparison.
-        self.depth_normalize = True
+        # Supervise D / A rather than raw D. OFF by default, on measurement.
+        # Normalisation provably removes the "fade instead of move" shortcut
+        # (its opacity gradient is <2% of the un-normalised one and cancels on
+        # a coplanar sheet), but on the reference capture it moved every
+        # surface metric slightly the wrong way: opacity 0.450 -> 0.425,
+        # floaters 6.1% -> 6.5%. The shortcut was real and was not the binding
+        # constraint. Enable with --depth_normalize to compare on your data.
+        self.depth_normalize = False
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):
