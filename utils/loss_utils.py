@@ -68,23 +68,61 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
 
 # --- Metric depth supervision -------------------------------------------------
 #
-# The rasterizer renders UNNORMALISED expected depth D = sum_i(d_i * alpha_i * T_i).
-# Wherever coverage is partial, D under-reports distance (a pixel at true depth
-# 3.0 with alpha 0.6 renders as 1.8), so supervising those pixels systematically
-# drags geometry toward the camera -- worst at depth discontinuities, and
-# silently. ALPHA_THRESHOLD gates which pixels are trustworthy enough to
-# supervise; dividing by alpha to "correct" D was considered and rejected as
-# numerically unstable near alpha = 0.
+# The rasterizer renders UNNORMALISED expected depth D = sum_i(d_i * alpha_i * T_i)
+# alongside accumulated coverage A = 1 - T_final.
+#
+# Supervising D directly is a trap. A misplaced splat can cut the depth error two
+# ways: MOVE onto the surface, or SHRINK its alpha so it contributes less to D.
+# Fading is the cheaper gradient, so the optimiser fades -- and the trained scene
+# ends up geometrically correct in expectation while being built out of
+# semi-transparent splats, which reads as holes in surfaces up close. Measured on
+# a real capture: surface opacity fell 0.590 -> 0.450 and surface scale
+# 0.247 m -> 0.189 m against an RGB-only baseline.
+#
+# Supervising D / A removes the escape route. Scale every alpha along a ray by a
+# constant and D scales with it while D / A barely moves, so fading buys the
+# optimiser essentially nothing and only relocation reduces the error. (The
+# invariance is exact for a single contributor or for coplanar ones, and
+# approximate otherwise, where D / A stays a convex combination of the
+# contributors' depths instead of collapsing toward zero the way D does.)
+#
+# ALPHA_THRESHOLD additionally gates which pixels are worth supervising at all,
+# which is also why the division is safe: we only ever evaluate the loss where
+# A > 0.95, so NORMALIZE_EPS is a guard against inf/NaN leaking out of masked-out
+# pixels, not a working part of the maths.
 
 ALPHA_THRESHOLD = 0.95
+
+# Only ever binds on pixels the mask discards; it exists so that A = 0 yields a
+# finite (large) number rather than an inf whose 0 * inf = NaN would poison the
+# whole reduction.
+NORMALIZE_EPS = 1e-6
+
+
+def normalized_depth(depth, alpha, eps=NORMALIZE_EPS):
+    """Opacity-invariant expected depth D / A.
+
+    `depth` and `alpha` are the rasterizer's outputs and BOTH carry gradient --
+    the alpha path is exactly what makes this loss refuse to pay for depth
+    accuracy in opacity. Returns a new tensor; neither input is mutated, which
+    matters because both are saved for the backward pass.
+
+    `alpha` may be shaped [H, W] against a [1, H, W] `depth`; it is unsqueezed
+    to match rather than relying on broadcasting to do the right thing.
+    """
+    if alpha.dim() == depth.dim() - 1:
+        alpha = alpha.unsqueeze(0)
+    return depth / alpha.clamp(min=eps)
 
 
 def depth_supervision_mask(sensor_mask, alpha, threshold=ALPHA_THRESHOLD):
     """AND the sensor's valid-depth mask with high-alpha rendered coverage.
 
-    `alpha` is the rasterizer's rendered alpha (render_pkg["alpha"]) and is
-    treated as non-differentiable here -- it is only used to build a boolean
-    mask, never to rescale a gradient-carrying tensor.
+    `alpha` is the rasterizer's rendered alpha (render_pkg["alpha"]). It is
+    detached here on purpose: the mask decides WHICH pixels are supervised, and
+    letting that decision carry gradient would be meaningless (a step function)
+    as well as unwanted. Gradient reaches alpha through normalized_depth
+    instead.
 
     sensor_mask: bool tensor, shaped [1, H, W] (or [H, W]).
     alpha:       float tensor, shaped [H, W] (or matching sensor_mask).

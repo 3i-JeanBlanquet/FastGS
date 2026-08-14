@@ -430,6 +430,7 @@ PerGaussianRenderCUDA(
 	const float* __restrict__ pixel_depths,
 	const float* __restrict__ dL_dpixels,
 	const float* __restrict__ dL_dpixel_depths,
+	const float* __restrict__ dL_dpixel_alphas,
 	float4* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
@@ -506,6 +507,10 @@ PerGaussianRenderCUDA(
 	// background.
 	float ar[C + 1];
 	float dL_dpixel[C + 1];
+	// The alpha output A = 1 - T_final has no per-Gaussian accumulator to
+	// replay -- its derivative depends only on T_final -- so it rides the warp
+	// pipeline as a lone scalar rather than as another ar[]/dL_dpixel[] slot.
+	float dL_dpixel_alpha = 0.0f;
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 
@@ -557,6 +562,7 @@ PerGaussianRenderCUDA(
 		T = my_warp.shfl_up(T, 1);
 		last_contributor = my_warp.shfl_up(last_contributor, 1);
 		T_final = my_warp.shfl_up(T_final, 1);
+		dL_dpixel_alpha = my_warp.shfl_up(dL_dpixel_alpha, 1);
 		for (int ch = 0; ch < C + 1; ++ch) {
 			ar[ch] = my_warp.shfl_up(ar[ch], 1);
 			dL_dpixel[ch] = my_warp.shfl_up(dL_dpixel[ch], 1);
@@ -582,6 +588,7 @@ PerGaussianRenderCUDA(
 				dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
 			}
 			dL_dpixel[C] = dL_dpixel_depths[pix_id];
+			dL_dpixel_alpha = dL_dpixel_alphas[pix_id];
 		}
 
 		// do work
@@ -620,6 +627,14 @@ PerGaussianRenderCUDA(
 				bg_dot_dpixel += bg_color[ch] * dL_dpixel[ch];
 			}
 			dL_dalpha += (-T_final * one_minus_alpha_reci) * bg_dot_dpixel;
+			// Alpha output. A = 1 - T_final and T_final = prod_j (1 - alpha_j),
+			// so dT_final/dalpha_i = -T_final / (1 - alpha_i) and therefore
+			// dA/dalpha_i = +T_final / (1 - alpha_i). Structurally the same
+			// term as the background one directly above -- which rides
+			// dT_final/dalpha_i and so carries the opposite sign -- and it needs
+			// no replayed accumulator, because A depends on this Gaussian only
+			// through the final transmittance.
+			dL_dalpha += (T_final * one_minus_alpha_reci) * dL_dpixel_alpha;
 			T *= (1.0f - alpha);
 
 
@@ -923,6 +938,7 @@ void BACKWARD::render(
 	const float* pixel_depths,
 	const float* dL_dpixels,
 	const float* dL_dpixel_depths,
+	const float* dL_dpixel_alphas,
 	float4* dL_dmean2D,
 	float4* dL_dconic2D,
 	float* dL_dopacity,
@@ -949,6 +965,7 @@ void BACKWARD::render(
 		pixel_depths,
 		dL_dpixels,
 		dL_dpixel_depths,
+		dL_dpixel_alphas,
 		dL_dmean2D,
 		dL_dconic2D,
 		dL_dopacity,

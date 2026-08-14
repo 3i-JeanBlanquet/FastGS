@@ -9,9 +9,30 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, ArgumentTypeError, Namespace
 import sys
 import os
+
+TRUTHY = ("true", "t", "yes", "y", "1")
+FALSY = ("false", "f", "no", "n", "0")
+
+
+def str2bool(text):
+    """Parse a command-line boolean word.
+
+    Needed for flags that DEFAULT TO TRUE: argparse's "store_true" can only ever
+    turn a flag on, so a True default is stuck on forever and there is no way to
+    ask for the other behaviour. Registering those with this as the type (and
+    nargs="?", const=True) keeps the bare `--flag` form working while also
+    accepting `--flag False`.
+    """
+    lowered = str(text).strip().lower()
+    if lowered in TRUTHY:
+        return True
+    if lowered in FALSY:
+        return False
+    raise ArgumentTypeError("expected a boolean word, got {!r}".format(text))
+
 
 class GroupParams:
     pass
@@ -25,14 +46,23 @@ class ParamGroup:
                 shorthand = True
                 key = key[1:]
             t = type(value)
-            value = value if not fill_none else None 
+            # A True default has to be switchable off; a False default keeps the
+            # historical bare-flag form so no existing command line changes.
+            default_true = (t == bool and value is True)
+            value = value if not fill_none else None
             if shorthand:
-                if t == bool:
+                if default_true:
+                    group.add_argument("--" + key, ("-" + key[0:1]), default=value,
+                                       type=str2bool, nargs="?", const=True)
+                elif t == bool:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, action="store_true")
                 else:
                     group.add_argument("--" + key, ("-" + key[0:1]), default=value, type=t)
             else:
-                if t == bool:
+                if default_true:
+                    group.add_argument("--" + key, default=value,
+                                       type=str2bool, nargs="?", const=True)
+                elif t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
                 else:
                     group.add_argument("--" + key, default=value, type=t)
@@ -112,6 +142,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_depth = 0.5
         self.depth_from_iter = 0
         self.depth_loss = "edgeaware_logl1"
+        # Supervise D / A rather than raw D. On by default: raw D lets the
+        # optimiser cut depth error by fading splats instead of moving them,
+        # which hollows out surfaces. `--depth_normalize False` restores the
+        # old un-normalised behaviour for comparison.
+        self.depth_normalize = True
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

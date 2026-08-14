@@ -386,6 +386,204 @@ def test_depth_backward_at_a_resolution_the_tile_grid_does_not_divide(W, H):
     assert g["opacities"].grad.abs().sum() > 1e-6
 
 
+# --------------------------------------------------------------------------
+# Path 3: dL/dA -> alpha -> opacity, scale and rotation.
+#
+# The rendered alpha A = 1 - T_final used to be marked non-differentiable,
+# which was defensible while it only ever fed a boolean mask. The normalised
+# depth loss D / A supervises THROUGH it, and that is the entire mechanism by
+# which normalisation works: it is what makes the loss invariant to a uniform
+# rescaling of the alphas, so fading a splat out stops being a way to reduce
+# depth error.
+#
+# T_final = prod_j (1 - alpha_j), so dT_final/dalpha_i = -T_final/(1 - alpha_i)
+# and dA/dalpha_i = +T_final/(1 - alpha_i). Note the sign: it is the NEGATIVE
+# of the background term the colour channel already carries, which rides
+# dT_final/dalpha_i directly. A sign error here is invisible to any test that
+# only checks the gradient is non-zero, hence the finite differences below.
+# --------------------------------------------------------------------------
+
+
+def test_alpha_output_carries_gradient_at_all():
+    """The regression guard for ctx.mark_non_differentiable(alpha).
+
+    While alpha was marked non-differentiable, .backward() on it raised
+    outright -- so this fails loudly rather than silently reading zeros.
+    """
+    from diff_gaussian_rasterization_fastgs import GaussianRasterizer
+
+    g = _one_gaussian(z=3.0, opacity=0.5)
+    g["opacities"] = g["opacities"].clone().requires_grad_(True)
+    out = GaussianRasterizer(_settings())(**g)
+    assert out[4].requires_grad, "the alpha output must be part of the graph"
+    out[4].sum().backward()
+    assert g["opacities"].grad is not None
+    assert g["opacities"].grad.abs().sum() > 1e-6
+
+
+def test_alpha_gradient_flows_to_scale():
+    from diff_gaussian_rasterization_fastgs import GaussianRasterizer
+
+    g = _one_gaussian(z=3.0, opacity=0.5)
+    g["scales"] = g["scales"].clone().requires_grad_(True)
+    out = GaussianRasterizer(_settings())(**g)
+    out[4].sum().backward()
+    assert g["scales"].grad is not None
+    # A bigger splat covers more pixels, so sum(A) grows with scale. The only
+    # route from A to scale is via alpha.
+    assert g["scales"].grad.abs().sum() > 1e-6
+
+
+def test_alpha_gradient_sign_is_positive_in_opacity():
+    """A more opaque splat covers more, so d(sum A)/d(opacity) > 0.
+
+    Flipping the sign of the new term -- the single most likely way to get it
+    wrong, since the adjacent background term is the same expression negated --
+    leaves the magnitude untouched and only this catches it.
+    """
+    from diff_gaussian_rasterization_fastgs import GaussianRasterizer
+
+    g = _one_gaussian(z=3.0, opacity=0.5)
+    g["opacities"] = g["opacities"].clone().requires_grad_(True)
+    out = GaussianRasterizer(_settings())(**g)
+    out[4].sum().backward()
+    assert g["opacities"].grad.item() > 0.0, \
+        "raising opacity must raise accumulated alpha"
+
+
+# --------------------------------------------------------------------------
+# Multi-bucket finite differences for the alpha path.
+#
+# _crowded_scene and _depth_ladder_scene are both useless here: they stack 150
+# splats onto the same few pixels, so T_final collapses to ~0 and dA/dalpha,
+# which is T_final/(1 - alpha), is numerically zero for every splat. That would
+# be a test of nothing. The scene below keeps >32 splats in ONE tile (so the
+# bucket index reaches >= 1 and the sampled_ar stride arithmetic is live) while
+# spreading them widely enough that coverage stays partial.
+# --------------------------------------------------------------------------
+
+COVER = 80          # ceil(80/32) = 3 buckets in the single 16x16 tile
+COVER_Z_STEP = 0.02  # depth ladder: perturbing opacity must not reorder splats
+
+# An order of magnitude below the 5e-3 the depth tests above use, and measured
+# rather than guessed. The splats here are faint (alpha ~ 0.15-0.35), so plenty
+# of their pixels sit near the kernel's `alpha < 1/255` cutoff and near the
+# opacity-dependent compact-box tile culling, where the loss genuinely steps.
+# Splat 49 shows it: at eps=5e-3 the central difference reads -0.993 against an
+# analytic -0.506, and at 1e-3 and 2e-4 it reads -0.50598 and -0.50597. The
+# large step straddles a discontinuity and measures the step; the smaller ones
+# measure the derivative, and every sampled splat then agrees with the analytic
+# gradient to better than 2e-4 absolute.
+COVER_EPS = 1e-3
+
+
+def _coverage_scene(requires_grad=False):
+    """80 modestly-sized splats spread across one 16x16 tile. Deterministic."""
+    g = torch.Generator(device="cpu").manual_seed(5)
+    xy = (torch.rand((COVER, 2), generator=g) - 0.5) * 2.4
+    z = 2.0 + COVER_Z_STEP * torch.arange(COVER, dtype=torch.float32).unsqueeze(1)
+    return dict(
+        means3D=torch.cat([xy, z], dim=1).cuda(),
+        means2D=torch.zeros((COVER, 4), device="cuda", requires_grad=True),
+        opacities=(0.15 + 0.20 * torch.rand((COVER, 1), generator=g)).cuda()
+                  .requires_grad_(requires_grad),
+        scales=torch.full((COVER, 3), 0.12, device="cuda"),
+        rotations=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(COVER, 1).cuda(),
+        colors_precomp=torch.rand((COVER, 3), generator=g).cuda())
+
+
+def test_coverage_scene_spans_buckets_without_saturating_alpha():
+    """Without both properties the finite-difference test below is inert."""
+    scene = _coverage_scene()
+    _color, radii, _counts, _depth, alpha = _render_crowd(scene)
+    assert (radii > 0).sum() > 32, "need >32 splats in one tile for >1 bucket"
+    assert alpha.max() > 0.3, "the splats must actually cover pixels"
+    # T_final = 1 - A must stay well clear of 0, or dA/dalpha vanishes and the
+    # finite difference measures noise instead of a derivative.
+    assert alpha.mean().item() < 0.9, \
+        "alpha saturates -- dA/dalpha would be ~0 everywhere"
+
+
+def _alpha_loss(scene, target):
+    # float64 reduction: a float32 sum over the image loses enough precision
+    # that a central difference suffers catastrophic cancellation.
+    alpha = _render_crowd(scene)[4]
+    return ((alpha.double() - target.double()) ** 2).sum()
+
+
+def test_alpha_opacity_gradients_survive_the_multi_bucket_replay():
+    scene = _coverage_scene(requires_grad=True)
+    g = torch.Generator(device="cpu").manual_seed(13)
+    target = torch.rand((TILE, TILE), generator=g).cuda()
+
+    _alpha_loss(scene, target).backward()
+    analytic = scene["opacities"].grad.clone().squeeze(1)
+    floor = _noise_floor(analytic)
+
+    worst = 0.0
+    checked = 0
+    for i in range(0, COVER, 7):
+        numeric = []
+        for sign in (+1.0, -1.0):
+            perturbed = _coverage_scene()
+            with torch.no_grad():
+                perturbed["opacities"][i, 0] += sign * COVER_EPS
+            numeric.append(_alpha_loss(perturbed, target).item())
+        finite_difference = (numeric[0] - numeric[1]) / (2 * COVER_EPS)
+        scale = max(floor, abs(analytic[i].item()), abs(finite_difference), 1e-9)
+        worst = max(worst, abs(analytic[i].item() - finite_difference) / scale)
+        checked += 1
+
+    assert checked > 5
+    # Deleting or negating the new term drives this to ~1.0 or ~2.0.
+    assert worst < 0.15, "worst relative gradient error {:.4f}".format(worst)
+
+
+def test_colour_depth_and_alpha_gradients_add_up():
+    """Wiring guard: the three outputs must be additive in dL/dopacity.
+
+    If the new alpha term leaked into the colour or depth replay -- crosstalk
+    in the warp shuffle pipeline, or in the shared staging -- this breaks even
+    though each output's own gradient still looks plausible.
+    """
+    from diff_gaussian_rasterization_fastgs import GaussianRasterizer
+
+    def grad_of(*outputs):
+        g = _one_gaussian(z=3.0, opacity=0.5)
+        g["opacities"] = g["opacities"].clone().requires_grad_(True)
+        out = GaussianRasterizer(_settings())(**g)
+        total = 0.0
+        for i in outputs:
+            total = total + out[i].double().sum()
+        total.backward()
+        return g["opacities"].grad.item()
+
+    parts = grad_of(0) + grad_of(3) + grad_of(4)
+    both = grad_of(0, 3, 4)
+    assert abs(both - parts) <= 1e-3 * max(1.0, abs(both))
+
+
+def test_alpha_gradient_is_zero_when_alpha_is_unused():
+    """The depth path must be unchanged by alpha becoming differentiable.
+
+    autograd materialises a zero grad for the unused alpha output, so a
+    depth-only loss must produce exactly the gradient it produced before.
+    """
+    from diff_gaussian_rasterization_fastgs import GaussianRasterizer
+
+    def grad_of(use_alpha):
+        g = _one_gaussian(z=3.0, opacity=0.5)
+        g["opacities"] = g["opacities"].clone().requires_grad_(True)
+        out = GaussianRasterizer(_settings())(**g)
+        total = out[3].double().sum()
+        if use_alpha:
+            total = total + 0.0 * out[4].double().sum()
+        total.backward()
+        return g["opacities"].grad.item()
+
+    assert abs(grad_of(False) - grad_of(True)) <= 1e-9 * max(1.0, abs(grad_of(False)))
+
+
 def test_colour_and_depth_gradients_add_up():
     """A combined loss must give exactly the sum of the two separate gradients.
 

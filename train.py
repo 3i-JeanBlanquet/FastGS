@@ -14,7 +14,7 @@ import numpy as np
 import os, random, time
 from random import randint
 from lpipsPyTorch import lpips
-from utils.loss_utils import l1_loss, depth_loss_fn, depth_supervision_mask
+from utils.loss_utils import l1_loss, depth_loss_fn, depth_supervision_mask, normalized_depth
 from fused_ssim import fused_ssim as fast_ssim
 from gaussian_renderer import render_fastgs, network_gui_ws
 import sys
@@ -104,15 +104,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
         if opt.lambda_depth > 0 and viewpoint_cam.sensor_depth is not None \
                 and iteration >= opt.depth_from_iter:
-            # render_pkg["depth"] is un-normalised expected depth D = sum(d*alpha*T);
-            # partial coverage under-reports distance, so we only ever supervise
-            # pixels the sensor trusts AND the renderer is confident about
-            # (alpha > 0.95). We never divide by alpha to "correct" D -- that is
-            # unstable near alpha = 0 -- and we build new tensors here rather
-            # than touching render_pkg["depth"] in place, since it is still
-            # needed by the backward pass.
+            # render_pkg["depth"] is un-normalised expected depth D = sum(d*alpha*T).
+            # By default we supervise D / A instead, which is invariant to a
+            # uniform rescaling of the alphas along a ray and so cannot be
+            # satisfied by fading splats out -- see utils/loss_utils. Pass
+            # --depth_normalize False to recover the original un-normalised
+            # behaviour for comparison.
+            #
+            # Either way we only supervise pixels the sensor trusts AND the
+            # renderer is confident about (alpha > 0.95), and we build new
+            # tensors here rather than touching render_pkg["depth"] in place,
+            # since it is still needed by the backward pass.
             pred_depth = render_pkg["depth"].unsqueeze(0)
             alpha = render_pkg["alpha"]
+            if opt.depth_normalize:
+                pred_depth = normalized_depth(pred_depth, alpha)
             gt_depth = viewpoint_cam.sensor_depth.to(pred_depth.device).float()
             sensor_mask = viewpoint_cam.depth_mask.to(alpha.device)
             # alpha is the current render's coverage, so this mask MUST be

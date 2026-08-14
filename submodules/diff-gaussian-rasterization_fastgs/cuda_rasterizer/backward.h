@@ -40,6 +40,7 @@ namespace BACKWARD
 		const float* pixel_depths,
 		const float* dL_dpixels,
 		const float* dL_dpixel_depths,
+		const float* dL_dpixel_alphas,
 		float4* dL_dmean2D,
 		float4* dL_dconic2D,
 		float* dL_dopacity,

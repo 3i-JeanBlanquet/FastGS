@@ -178,6 +178,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& dL_dout_color,
 	const torch::Tensor& out_depth,
 	const torch::Tensor& dL_dout_depth,
+	// Per-pixel gradient of the loss w.r.t. the rendered alpha A = 1 - T_final.
+	// A normalised depth loss D/A supervises geometry without paying in opacity,
+	// which needs this path to exist: without it the only way the optimiser can
+	// reduce depth error through alpha is to fade splats out.
+	const torch::Tensor& dL_dout_alpha,
 	const torch::Tensor& dc,
 	const torch::Tensor& sh,
 	const int degree,
@@ -240,6 +245,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	  out_depth.contiguous().data<float>(),
 	  dL_dout_color.contiguous().data<float>(),
 	  dL_dout_depth.contiguous().data<float>(),
+	  dL_dout_alpha.contiguous().data<float>(),
 	  dL_dmeans2D.contiguous().data<float>(),
 	  dL_dconic.contiguous().data<float>(),
 	  dL_dopacity.contiguous().data<float>(),

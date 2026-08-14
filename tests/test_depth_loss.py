@@ -21,6 +21,7 @@ from utils.loss_utils import (
     depth_loss_fn,
     depth_supervision_mask,
     edge_aware_logl1_loss,
+    normalized_depth,
 )
 
 
@@ -275,3 +276,140 @@ def test_sync_free_masked_reduction_matches_old_gather_form_when_fully_true():
         old = _OLD_GATHER_TABLE[name](pred, gt, rgb, mask)
         new = depth_loss_fn(name)(pred, gt, rgb, mask)
         assert torch.allclose(old, new, atol=1e-6), name
+
+
+# --------------------------------------------------------------------------
+# Normalised depth D / A.
+#
+# CUDA-free coverage of the helper itself -- shapes, the eps guard, gradient
+# reaching alpha, and non-mutation of the rasterizer's saved tensors. The
+# property that makes it worth doing at all (opacity invariance) needs a real
+# render and lives in tests/test_depth_normalization.py.
+# --------------------------------------------------------------------------
+
+
+def test_normalized_depth_divides_by_alpha():
+    depth = torch.tensor([[[2.4, 1.5]]])
+    alpha = torch.tensor([[0.8, 0.5]])
+    got = normalized_depth(depth, alpha)
+    assert torch.allclose(got, torch.tensor([[[3.0, 3.0]]]))
+
+
+def test_normalized_depth_broadcasts_a_bare_hw_alpha():
+    depth = torch.rand(1, 4, 5) + 1.0
+    alpha = torch.rand(4, 5) * 0.5 + 0.5
+    got = normalized_depth(depth, alpha)
+    assert got.shape == (1, 4, 5)
+    assert torch.allclose(got, depth / alpha.unsqueeze(0))
+
+
+def test_normalized_depth_accepts_matching_shapes_unchanged():
+    depth = torch.rand(1, 4, 5) + 1.0
+    alpha = torch.rand(1, 4, 5) * 0.5 + 0.5
+    assert torch.allclose(normalized_depth(depth, alpha), depth / alpha)
+
+
+def test_normalized_depth_is_finite_at_zero_alpha():
+    """The eps guard. These pixels are always masked out, but 0/0 -> NaN would
+    poison the whole reduction through the multiply-and-sum, so it must not
+    happen even there."""
+    depth = torch.zeros(1, 3, 3)
+    alpha = torch.zeros(3, 3)
+    got = normalized_depth(depth, alpha)
+    assert torch.isfinite(got).all()
+    assert float(got.abs().max()) == 0.0
+
+
+def test_normalized_depth_never_produces_nan_in_a_masked_reduction():
+    depth = torch.rand(1, 6, 6)
+    alpha = torch.zeros(6, 6)
+    alpha[0, 0] = 0.99
+    gt = torch.ones(1, 6, 6)
+    rgb = torch.zeros(3, 6, 6)
+    mask = (alpha > ALPHA_THRESHOLD).unsqueeze(0)
+    pred = normalized_depth(depth, alpha)
+    for name in ("edgeaware_logl1", "logl1", "l1", "huber"):
+        out = depth_loss_fn(name)(pred, gt, rgb, mask)
+        assert torch.isfinite(out), name
+
+
+def test_normalized_depth_does_not_mutate_its_inputs():
+    """Both inputs are saved for the rasterizer's backward pass."""
+    depth = torch.rand(1, 4, 4) + 1.0
+    alpha = torch.rand(4, 4) * 0.5 + 0.5
+    d0, a0 = depth.clone(), alpha.clone()
+    normalized_depth(depth, alpha)
+    assert torch.equal(depth, d0) and torch.equal(alpha, a0)
+
+
+def test_normalized_depth_carries_gradient_into_alpha():
+    """The point of un-marking alpha non-differentiable: without a gradient
+    path into alpha the division would be cosmetic."""
+    depth = (torch.rand(1, 4, 4) + 1.0).requires_grad_(True)
+    alpha = (torch.rand(4, 4) * 0.5 + 0.5).requires_grad_(True)
+    normalized_depth(depth, alpha).sum().backward()
+    assert alpha.grad is not None and alpha.grad.abs().sum() > 0
+    assert depth.grad is not None and depth.grad.abs().sum() > 0
+
+
+def test_depth_supervision_mask_still_blocks_gradient_through_the_mask():
+    """Masking must stay detached even now that alpha is differentiable."""
+    alpha = (torch.rand(4, 4) * 0.1 + 0.9).requires_grad_(True)
+    sensor = torch.ones(1, 4, 4, dtype=torch.bool)
+    mask = depth_supervision_mask(sensor, alpha)
+    assert not mask.requires_grad
+
+
+# --------------------------------------------------------------------------
+# --depth_normalize.
+#
+# Defaults to True (the new behaviour) and must be switchable OFF so the old
+# un-normalised path stays runnable and comparable. argparse's "store_true"
+# cannot express that -- a True default is stuck on -- so ParamGroup registers
+# True-defaulted bools with a word-parsing type instead.
+# --------------------------------------------------------------------------
+
+
+def _optimization_args(argv):
+    from argparse import ArgumentParser
+
+    from arguments import OptimizationParams
+
+    parser = ArgumentParser()
+    op = OptimizationParams(parser)
+    return op.extract(parser.parse_args(argv))
+
+
+def test_depth_normalize_defaults_to_true():
+    assert _optimization_args([]).depth_normalize is True
+
+
+def test_depth_normalize_can_be_switched_off():
+    assert _optimization_args(["--depth_normalize", "False"]).depth_normalize is False
+    assert _optimization_args(["--depth_normalize", "false"]).depth_normalize is False
+    assert _optimization_args(["--depth_normalize", "0"]).depth_normalize is False
+
+
+def test_depth_normalize_bare_flag_still_means_true():
+    assert _optimization_args(["--depth_normalize"]).depth_normalize is True
+    assert _optimization_args(["--depth_normalize", "True"]).depth_normalize is True
+
+
+def test_depth_normalize_does_not_swallow_the_next_option():
+    args = _optimization_args(["--depth_normalize", "--lambda_depth", "0.25"])
+    assert args.depth_normalize is True
+    assert args.lambda_depth == 0.25
+
+
+def test_false_defaulted_bools_keep_the_bare_flag_form():
+    """The store_true path must be untouched for every other boolean."""
+    from argparse import ArgumentParser
+
+    from arguments import ModelParams
+
+    parser = ArgumentParser()
+    lp = ModelParams(parser)
+    args = lp.extract(parser.parse_args(["-s", "/tmp/x", "--eval", "--init_from_depth"]))
+    assert args.eval is True and args.init_from_depth is True
+    args = lp.extract(parser.parse_args(["-s", "/tmp/x"]))
+    assert args.eval is False and args.init_from_depth is False

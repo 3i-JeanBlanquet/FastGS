@@ -110,8 +110,11 @@ class _RasterizeGaussians(torch.autograd.Function):
         # accumulator against the final rendered depth, exactly as the colour
         # replay uses the final rendered colour.
         ctx.save_for_backward(colors_precomp, means3D, scales, rotations, cov3Ds_precomp, radii, dc, sh, geomBuffer, binningBuffer, imgBuffer, sampleBuffer, depth)
-        # Alpha is a diagnostic/masking output only -- no gradient flows through it.
-        ctx.mark_non_differentiable(alpha)
+        # Alpha IS differentiable. It used to be marked non-differentiable, on
+        # the grounds that it only ever fed a boolean mask; a normalised depth
+        # loss D/A supervises through it, and that normalisation is the whole
+        # point -- it is what stops the optimiser buying depth accuracy by
+        # fading splats out instead of moving them.
         return color, radii, accum_metric_counts, depth, alpha
 
     @staticmethod
@@ -139,6 +142,7 @@ class _RasterizeGaussians(torch.autograd.Function):
                 grad_out_color,
                 depth,
                 grad_out_depth,
+                grad_out_alpha,
                 dc,
                 sh, 
                 raster_settings.sh_degree, 
